@@ -1,0 +1,13 @@
+repositories:
+  src/lightning:
+    type: git
+    url: https://github.com/DeepRoboticsLab/lightning-lm-deep-robotics.git
+    version: 31ce5190bb2dc9c8be99a572fe2413380ad60cd6
+  src/rslidar_sdk:
+    type: git
+    url: https://github.com/RoboSense-LiDAR/rslidar_sdk.git
+    version: v1.5.19
+  src/rslidar_msg:
+    type: git
+    url: https://github.com/RoboSense-LiDAR/rslidar_msg.git
+    version: fe8a95cb242bd294cc3d5e3422f2093fb49a56ee

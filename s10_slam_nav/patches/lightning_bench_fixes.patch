@@ -1,0 +1,134 @@
+diff --git a/src/lightning/src/app/run_loc_online.cc b/src/lightning/src/app/run_loc_online.cc
+index 07068e4..feb275b 100644
+--- a/src/lightning/src/app/run_loc_online.cc
++++ b/src/lightning/src/app/run_loc_online.cc
+@@ -2,6 +2,7 @@
+ // Created by xiang on 25-3-18.
+ //
+ 
++#include <vector>
+ #include <gflags/gflags.h>
+ #include <glog/logging.h>
+ 
+@@ -17,7 +18,20 @@ int main(int argc, char** argv) {
+     FLAGS_colorlogtostderr = true;
+     FLAGS_stderrthreshold = google::INFO;
+ 
+-    google::ParseCommandLineFlags(&argc, &argv, true);
++    // ros2 launch appends "--ros-args" to node command lines; gflags rejects
++    // the unknown flag.  Parse only the leading gflags tokens on a private
++    // copy (ParseCommandLineFlags nulls removed slots, which would corrupt
++    // argv for the rclcpp::init call below), and leave "--ros-args" intact.
++    int gflags_argc = argc;
++    for (int i = 1; i < argc; ++i) {
++        if (std::string(argv[i]) == "--ros-args") {
++            gflags_argc = i;
++            break;
++        }
++    }
++    std::vector<char*> gflags_argv(argv, argv + gflags_argc);
++    char** gflags_argv_ptr = gflags_argv.data();
++    google::ParseCommandLineFlags(&gflags_argc, &gflags_argv_ptr, true);
+     using namespace lightning;
+ 
+     rclcpp::init(argc, argv);
+diff --git a/src/lightning/src/app/run_slam_online.cc b/src/lightning/src/app/run_slam_online.cc
+index 297f516..713d7fb 100644
+--- a/src/lightning/src/app/run_slam_online.cc
++++ b/src/lightning/src/app/run_slam_online.cc
+@@ -2,6 +2,7 @@
+ // Created by xiang on 25-3-18.
+ //
+ 
++#include <vector>
+ #include <gflags/gflags.h>
+ #include <glog/logging.h>
+ #include <csignal>
+@@ -33,7 +34,20 @@ int main(int argc, char** argv) {
+     google::InitGoogleLogging(argv[0]);
+     FLAGS_colorlogtostderr = true;
+     FLAGS_stderrthreshold = google::INFO;
+-    google::ParseCommandLineFlags(&argc, &argv, true);
++    // ros2 launch appends "--ros-args" to node command lines; gflags rejects
++    // the unknown flag.  Parse only the leading gflags tokens on a private
++    // copy (ParseCommandLineFlags nulls removed slots, which would corrupt
++    // argv for the rclcpp::init call below), and leave "--ros-args" intact.
++    int gflags_argc = argc;
++    for (int i = 1; i < argc; ++i) {
++        if (std::string(argv[i]) == "--ros-args") {
++            gflags_argc = i;
++            break;
++        }
++    }
++    std::vector<char*> gflags_argv(argv, argv + gflags_argc);
++    char** gflags_argv_ptr = gflags_argv.data();
++    google::ParseCommandLineFlags(&gflags_argc, &gflags_argv_ptr, true);
+ 
+     using namespace lightning;
+ 
+diff --git a/src/lightning/src/core/system/slam.cc b/src/lightning/src/core/system/slam.cc
+index 64ebe68..b1e642f 100644
+--- a/src/lightning/src/core/system/slam.cc
++++ b/src/lightning/src/core/system/slam.cc
+@@ -66,6 +66,7 @@ bool SlamSystem::Init(const std::string& yaml_path) {
+         if (map_path.back() == '/') {
+             map_path.pop_back();
+         }
++        map_path_dir_ = map_path;
+         size_t last_slash = map_path.find_last_of('/');
+         if (last_slash != std::string::npos) {
+             map_name_ = map_path.substr(last_slash + 1);
+@@ -207,8 +208,20 @@ void SlamSystem::StartSLAM(std::string map_name) {
+ 
+ void SlamSystem::SaveMap(const SaveMapService::Request::SharedPtr request,
+                          SaveMapService::Response::SharedPtr response) {
+-    map_name_ = request->map_id;
+-    std::string save_path = "./data/" + map_name_ + "/";
++    std::string save_path;
++    if (!request->map_id.empty()) {
++        map_name_ = request->map_id;
++        save_path = "./data/" + map_name_ + "/";
++    } else if (!map_path_dir_.empty()) {
++        // S10 patch: with an empty map_id save into the absolute YAML
++        // system.map_path directory.  The previous ./data/<id>/ default was
++        // relative to the process working directory and silently wrote (or
++        // wiped) the wrong location when launched from elsewhere.
++        save_path = map_path_dir_ + "/";
++    } else {
++        map_name_ = "new_map";
++        save_path = "./data/new_map/";
++    }
+ 
+     SaveMap(save_path);
+     response->response = 0;
+diff --git a/src/lightning/src/core/system/slam.h b/src/lightning/src/core/system/slam.h
+index 85cdc90..2b86979 100644
+--- a/src/lightning/src/core/system/slam.h
++++ b/src/lightning/src/core/system/slam.h
+@@ -101,6 +101,7 @@ class SlamSystem {
+     rclcpp::Service<srv::SavePath>::SharedPtr savepath_service_ = nullptr;
+ 
+     std::string map_name_;  // 地图名
++    std::string map_path_dir_;  // absolute YAML system.map_path (S10 patch)
+ 
+     std::shared_ptr<LaserMapping> lio_ = nullptr;       // lio 前端
+     std::shared_ptr<LoopClosing> lc_ = nullptr;         // 回环检测
+diff --git a/src/lightning/src/ui/pangolin_window_impl.cc b/src/lightning/src/ui/pangolin_window_impl.cc
+index 86f578a..4f8150e 100644
+--- a/src/lightning/src/ui/pangolin_window_impl.cc
++++ b/src/lightning/src/ui/pangolin_window_impl.cc
+@@ -53,11 +53,10 @@ void PangolinWindowImpl::Reset(const std::vector<Keyframe::Ptr> &keyframes) {
+     for (; i < keyframes.size(); ++i) {
+         const auto &keyframe = keyframes.at(i);
+         current_scan_ui_ = std::make_shared<ui::UiCloud>();
+-#ifdef LIGHTNING_ARM_PLATFORM
+-        CloudPtr tmp_cloud = boost::make_shared<PointCloudType>(*(keyframe->GetCloud()));
+-#else
++        // Upstream used boost::make_shared on ARM for older PCL (boost-based
++        // shared_ptr). PCL >= 1.12 (Ubuntu 24.04) aliases PointCloud::Ptr to
++        // std::shared_ptr, so boost::make_shared no longer compiles on ARM.
+         CloudPtr tmp_cloud = std::make_shared<PointCloudType>(*(keyframe->GetCloud()));
+-#endif
+         current_scan_ui_->SetCloud(math::VoxelGrid(tmp_cloud, 0.5), keyframe->GetOptPose());
+         current_scan_ui_->SetRenderColor(ui::UiCloud::UseColor::HEIGHT_COLOR);
+ 

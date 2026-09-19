@@ -1,0 +1,25 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -5,9 +5,10 @@ project(rslidar_sdk)
+ #=======================================
+ # Custom Point Type (XYZI,XYZIRT, XYZIF, XYZIRTF)
+ #=======================================
+-set(POINT_TYPE XYZI)
++set(POINT_TYPE "XYZIRT" CACHE STRING "Point type (XYZI, XYZIRT, XYZIF, XYZIRTF)")
++set_property(CACHE POINT_TYPE PROPERTY STRINGS XYZI XYZIRT XYZIF XYZIRTF)
+ 
+-option(ENABLE_TRANSFORM "Enable transform functions" OFF)
++option(ENABLE_TRANSFORM "Enable transform functions" ON)
+ if(${ENABLE_TRANSFORM})
+   add_definitions("-DENABLE_TRANSFORM")
+   find_package(Eigen3 REQUIRED)
+@@ -45,7 +46,7 @@ if(${ENABLE_SOURCE_PACKET_LEGACY})
+   add_definitions("-DENABLE_SOURCE_PACKET_LEGACY")
+ endif(${ENABLE_SOURCE_PACKET_LEGACY})
+ 
+-option(ENABLE_IMU_DATA_PARSE           "Enable imu data parse" OFF)
++option(ENABLE_IMU_DATA_PARSE           "Enable imu data parse" ON)
+ if(${ENABLE_IMU_DATA_PARSE})
+ 
+   message(=============================================================)

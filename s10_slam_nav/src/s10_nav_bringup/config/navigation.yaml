@@ -1,0 +1,81 @@
+s10_route_follower:
+  ros__parameters:
+    odom_topic: /lightning/odom
+    command_topic: /s10_nav/cmd_tracking
+    control_rate_hz: 20.0
+    odom_timeout_sec: 0.30
+    search_back_points: 10
+    search_forward_points: 120
+    missed_checkpoint_margin_m: 0.80
+    goal_tolerance_m: 0.25
+
+s10_obstacle_guard:
+  ros__parameters:
+    front_topic: /rslidar_front/points
+    rear_topic: /rslidar_rear/points
+    expected_frame_id: lidar_link
+    cloud_timeout_sec: 0.8
+    sample_stride: 4
+    detection_length_m: 2.00
+    corridor_half_width_m: 0.45
+    side_width_m: 1.20
+    min_z_m: -0.30
+    max_z_m: 1.20
+    self_min_x_m: -0.45
+    self_max_x_m: 0.45
+    self_half_width_m: 0.28
+    emergency_distance_m: 0.60
+    avoid_trigger_distance_m: 0.90
+    slow_distance_m: 1.20
+    minimum_side_clearance_m: 1.00
+    enable_avoidance: true
+    avoidance_speed_mps: 0.15
+    avoidance_yaw_rate_rps: 0.30
+    clear_confirm_cycles: 6
+    update_rate_hz: 20.0
+
+s10_health_monitor:
+  ros__parameters:
+    odom_topic: /lightning/odom
+    imu_topic: /IMU
+    front_cloud_topic: /rslidar_front/points
+    rear_cloud_topic: /rslidar_rear/points
+    require_rear_cloud: true
+    odom_timeout_sec: 0.30
+    imu_timeout_sec: 0.5
+    cloud_timeout_sec: 0.8
+    max_position_jump_m: 0.50
+    max_yaw_jump_deg: 15.0
+    stable_samples: 10
+    update_rate_hz: 20.0
+
+s10_command_mux:
+  ros__parameters:
+    output_rate_hz: 50.0
+    command_timeout_sec: 0.25
+    max_vx_mps: 0.80
+    max_vy_mps: 0.20
+    max_wz_rps: 0.50
+    max_linear_accel_mps2: 0.60
+    max_lateral_accel_mps2: 0.40
+    max_angular_accel_rps2: 0.80
+    steer_vx_scale_mps: 1.50
+    steer_vy_scale_mps: 0.50
+    steer_wz_scale_rps: 0.60
+
+    # ---- 输出通道 ----
+    # asdu : 只发 ASDU UDP 轴指令，直连机器人本体（不需要 rl_deploy）
+    # dds  : 只发 /STEER（需 rl_deploy 以 kDDS 模式订阅）
+    # both : 两路都发（⚠️ 只在确认只有一个接收端生效时用）
+    output_channel: asdu
+    asdu_host: 10.21.33.103
+    asdu_port: 30004
+    asdu_heartbeat_hz: 1.0
+
+    # ---- 机器人状态门（仅 asdu 通道生效）----
+    # 轴指令在非 RL 控制状态下会被机器人【静默忽略】（无响应帧），
+    # 没有这道门，导航栈会以为在走、实际机器人一动不动。
+    #   ROBOT_NOT_RL       机器人不在 MotionState=17
+    #   ROBOT_STATUS_LOST  超过 robot_status_timeout_sec 没收到状态上报
+    require_rl_control: true
+    robot_status_timeout_sec: 1.0

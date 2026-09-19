@@ -1,0 +1,61 @@
+diff --git a/package.xml b/package.xml
+--- a/package.xml
++++ b/package.xml
+@@ -12,8 +12,6 @@
+     <build_depend>rosidl_default_generators</build_depend>
+     <exec_depend>rosidl_default_runtime</exec_depend>
+     
+-    <depend>scrubber_common</depend>
+-    <depend>agibot_robot</depend>
+     <depend>rclcpp</depend>
+     <depend>std_msgs</depend>
+     <depend>geometry_msgs</depend>
+diff --git a/src/app/run_loc_online.cc b/src/app/run_loc_online.cc
+--- a/src/app/run_loc_online.cc
++++ b/src/app/run_loc_online.cc
+@@ -33,9 +33,11 @@ int main(int argc, char** argv) {
+         LOG(ERROR) << "failed to init loc";
+     }
+ 
+-    /// 如果没有设置初始位姿，则从0开始
+-    if (opt.use_init_pose_) {
+-        loc.SetInitPose(opt.init_pose_);
++    /// Init() loads YAML into LocSystem's internal options.  Use those loaded
++    /// options rather than the stale local copy passed to the constructor.
++    const auto& configured_opt = loc.GetOptions();
++    if (configured_opt.use_init_pose_) {
++        loc.SetInitPose(configured_opt.init_pose_);
+     } else {
+         loc.SetInitPose(SE3());
+     }
+diff --git a/src/core/lio/pointcloud_preprocess.cc b/src/core/lio/pointcloud_preprocess.cc
+--- a/src/core/lio/pointcloud_preprocess.cc
++++ b/src/core/lio/pointcloud_preprocess.cc
+@@ -237,6 +237,14 @@ void PointCloudPreprocess::RobosenseHandler(const sensor_msgs::msg::PointCloud2:
+     int plsize = pl_orig.points.size();
+     cloud_out_.reserve(plsize);
+ 
++    if (plsize == 0) {
++        LOG(WARNING) << "received an empty RoboSense point cloud";
++        cloud_out_.width = 0;
++        cloud_out_.height = 1;
++        cloud_out_.is_dense = false;
++        return;
++    }
++
+     double start_time = pl_orig.points[0].timestamp ;
+ 
+     for (int i = 0; i < plsize; i++) {
+diff --git a/src/core/system/loc_system.h b/src/core/system/loc_system.h
+--- a/src/core/system/loc_system.h
++++ b/src/core/system/loc_system.h
+@@ -46,6 +46,9 @@ class LocSystem {
+     /// 设置初始化位姿
+     void SetInitPose(const SE3& pose);
+ 
++    /// 返回从配置文件加载后的选项，供启动程序选择正确的初始位姿。
++    const Options& GetOptions() const { return options_; }
++
+     /// 处理IMU
+     void ProcessIMU(const lightning::IMUPtr& imu);
+ 

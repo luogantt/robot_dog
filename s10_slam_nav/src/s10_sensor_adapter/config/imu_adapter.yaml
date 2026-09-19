@@ -1,0 +1,18 @@
+s10_imu_adapter:
+  ros__parameters:
+    input_topic: /rslidar_front/imu
+    output_topic: /IMU
+    output_frame_id: lidar_link
+    # Measured on the bench (2026-09-06, robot static):
+    #  - rs_driver/RSAIRY emits acceleration in g units (static ~1.0), not m/s^2.
+    #  - raw IMU "up" is -y; lidar_link is z-up (ground normal ~= -z in the
+    #    driver-transformed cloud). roll=-90 deg maps raw up to lidar_link +z.
+    #  - The IMU rotation therefore does NOT match the cloud extrinsic in
+    #    airy_dual.yaml (roll=0, pitch=-90 deg, yaw=-180 deg).
+    #  - In-plane yaw (about vertical) is unobservable while static: confirm or
+    #    adjust it in the first real motion test before relying on heading.
+    roll: -1.5707963
+    pitch: 0.0
+    yaw: 0.0
+    accel_scale: 9.80665
+    warn_gap_sec: 0.10

@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>s10_nav_bringup</name>
+  <version>0.1.0</version>
+  <description>Launch, configuration and field-operation files for S10 final-round navigation.</description>
+  <maintainer email="team@example.com">S10 Team</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>rslidar_sdk</exec_depend>
+  <exec_depend>lightning</exec_depend>
+  <exec_depend>s10_sensor_adapter</exec_depend>
+  <exec_depend>s10_route_nav</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

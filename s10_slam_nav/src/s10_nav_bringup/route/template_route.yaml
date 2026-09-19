@@ -1,0 +1,31 @@
+# Safety-only template. Record and pass the real route_file before enabling autonomy.
+frame_id: map
+route_name: template_do_not_race
+loop: false
+warn_corridor_error: 0.40
+max_corridor_error: 0.60
+
+controller:
+  lookahead: 0.90
+  nominal_speed: 0.35
+  max_speed: 0.40
+  max_yaw_rate: 0.40
+  goal_slow_radius: 1.20
+  curvature_speed_gain: 1.50
+  heading_gain: 1.80
+  heading_slow_threshold_deg: 30.0
+  yaw_only_threshold_deg: 60.0
+
+checkpoints:
+  - id: TEST_ONLY
+    x: 1.0
+    y: 0.0
+    yaw: 0.0
+    position_tolerance: 0.25
+    yaw_tolerance_deg: 180.0
+    required: true
+
+path:
+  - [0.0, 0.0, 0.0]
+  - [0.5, 0.0, 0.0]
+  - [1.0, 0.0, 0.0]
