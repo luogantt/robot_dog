@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>机器狗遥控</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- ============ 顶部：连接与控制权 ============ -->
+<div id="banner" class="banner hidden"></div>
+
+<header>
+  <h1>机器狗遥控 <span id="axisTag" class="tag"></span></h1>
+  <div class="conn">
+    <span id="connDot" class="dot"></span>
+    <span id="connText">连接中…</span>
+  </div>
+</header>
+
+<!-- ============ 机身状态 ============ -->
+<section class="panel status">
+  <div class="stat"><label>运动状态</label><b id="sMotion">—</b></div>
+  <div class="stat"><label>步态</label><b id="sGait">—</b></div>
+  <div class="stat"><label>使用模式</label><b id="sMode">—</b></div>
+  <div class="stat"><label>前进速度</label><b id="sVx">—</b><i>m/s</i></div>
+  <div class="stat"><label>转向速度</label><b id="sWz">—</b><i>rad/s</i></div>
+  <div class="stat"><label>轴指令</label><b id="sAxis">—</b></div>
+  <div class="stat"><label>硬急停 HES</label><b id="sHes">—</b></div>
+  <div class="stat"><label>机型</label><b id="sModel">—</b></div>
+  <div class="stat"><label>控制率</label><b id="sHz">—</b><i>Hz</i></div>
+  <div class="stat"><label>你的客户端</label><b id="sYou">—</b></div>
+  <div class="stat"><label>控制权</label><b id="sCtrl">—</b></div>
+</section>
+
+<div id="faults" class="faults hidden"></div>
+
+<!-- ============ 主体：左操控 / 右设置 ============ -->
+<main>
+  <section class="panel ctrl">
+    <h2>操控</h2>
+
+    <div class="pad">
+      <button class="mv" data-axis="x" data-dir="1"  style="grid-area:u">▲<small>前进</small></button>
+      <button class="mv" data-axis="yaw" data-dir="-1" style="grid-area:l">◀<small>左转</small></button>
+      <button class="mv stop" data-axis="stop" style="grid-area:c">■<small>停</small></button>
+      <button class="mv" data-axis="yaw" data-dir="1" style="grid-area:r">▶<small>右转</small></button>
+      <button class="mv" data-axis="x" data-dir="-1" style="grid-area:d">▼<small>后退</small></button>
+    </div>
+
+    <!-- 平移方向按文档 §1.2.5：Y=+1 是左移，Y=-1 是右移。
+         实机实测与文档一致（不像 Yaw 那样相反），所以这里不要改反。 -->
+    <div class="strafe">
+      <button class="mv" data-axis="y" data-dir="1">◀ 左移</button>
+      <button class="mv" data-axis="y" data-dir="-1">右移 ▶</button>
+    </div>
+
+    <div class="joywrap">
+      <div id="joy" class="joy">
+        <div class="joycross"></div>
+        <div id="knob" class="knob"></div>
+      </div>
+      <div class="joyhint">拖动摇杆<br><small>左右 = 转向　上下 = 前后</small></div>
+    </div>
+
+    <p class="hint">按住按钮持续动，松手立即停。键盘：W/S 前后、A/D 转向、Q/E 平移、空格急停。</p>
+  </section>
+
+  <section class="panel">
+    <h2>速度上限</h2>
+    <div class="slider">
+      <input type="range" id="scale" min="2" max="60" value="15">
+      <div class="sliderVal"><b id="scaleVal">0.15</b> <small>相对满速的比例</small></div>
+    </div>
+    <p class="hint">起步建议先小后大。满速 1.00 对应文档 §1.2.6 给出的 ±1.67 m/s
+      （滑条上限由服务端 <code>--max-scale</code> 决定）。</p>
+
+    <h2>步态切换</h2>
+    <div id="gaits" class="btns"></div>
+    <p class="hint" id="gaitHint">切换前须让机器人完全停止（文档 §1.2.4），否则指令会被缓存。</p>
+
+    <h2>机身动作</h2>
+    <div class="btns">
+      <button id="btnStand"  class="act" data-needs-control="1">起立</button>
+      <button id="btnCrouch" class="act" data-needs-control="1">趴下</button>
+    </div>
+
+    <h2>使用模式切换</h2>
+    <div id="modes" class="btns"></div>
+    <p class="hint">常规/辅助模式用比例轴指令（文档 §1.2.5），导航模式用真实轴指令（§1.2.6）。切换步态会自动改名当前模式。</p>
+
+    <h2>控制权</h2>
+    <div class="btns">
+      <button id="btnClaim" class="act">接管控制</button>
+    </div>
+    <p class="hint" id="ctrlHint">同一时刻只允许一个操作者，避免多人同时操控。</p>
+  </section>
+</main>
+
+<!-- ============ 急停 ============ -->
+<div class="estopbar">
+  <button id="estop" class="estop">急 停</button>
+  <button id="estopReset" class="estopReset hidden">解除急停</button>
+</div>
+
+<!-- ============ 关节温度 ============ -->
+<section class="panel temps">
+  <h2>关节温度 <small id="tempHint" class="tempHint"></small></h2>
+  <div id="tempGrid" class="tempGrid"></div>
+  <p class="hint">
+    每格 <b>电机 / 驱动器</b>（°C）。<span class="tLegend">&lt;60 正常</span>
+    <span class="tLegend warn">60~74 偏热</span>
+    <span class="tLegend hot">≥75 过热</span>
+    <span class="tLegend flag">⚠ = 机器人报了过温故障</span>
+  </p>
+</section>
+
+<!-- ============ 日志 ============ -->
+<section class="panel logpanel">
+  <h2>事件日志</h2>
+  <div id="log" class="log"></div>
+</section>
+
+<script src="/app.js"></script>
+</body>
+</html>

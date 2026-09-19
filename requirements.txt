@@ -1,0 +1,11 @@
+# Web 遥控界面所需依赖
+#
+# 只有 web_control.py 需要这些；其余脚本（asdu_udp_control.py / robot_sim.py /
+# tools/ 下的两个工具）只用 Python 标准库，零依赖。
+#
+# 如果用的是本机已装的 Anaconda（Python 3.10.9），下面这些已经自带，无需安装：
+#   fastapi 0.118.2 / uvicorn 0.37.0 / starlette 0.48.0 / websockets 15.0.1
+
+fastapi>=0.100
+uvicorn>=0.23
+websockets>=12.0        # 测试脚本 tests/test_web_control.py 需要

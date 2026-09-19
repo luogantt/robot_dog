@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 本地临时产物
+tmp/
+*.log
+
+# 编辑器 / AI 工具
+.claude/
+.vscode/
+.idea/
+
+# 系统
+Thumbs.db
+.DS_Store
