@@ -6,9 +6,13 @@
 
 | 目录 | 说明 |
 |---|---|
-| [`robot_dog_sdk/`](robot_dog_sdk/) | **主项目** —— ASDU/UDP 协议实现 + Web 遥控界面 + 模拟器 + 测试 |
+| [`robot_dog_sdk/`](robot_dog_sdk/) | **ASDU 协议 + Web 遥控** —— 遥控界面、模拟器、命令行工具、测试 |
+| [`follow/`](follow/) | **AprilTag 追踪** —— 让机器狗跟着 tag 走，保持在 1 米距离 |
 
-具体用法、安全注意事项、实机验证记录，看 [robot_dog_sdk/README.md](robot_dog_sdk/README.md)。
+各项目的用法、安全注意事项、实机验证记录，看各自的 README：
+
+- [robot_dog_sdk/README.md](robot_dog_sdk/README.md)
+- [follow/README.md](follow/README.md)
 
 ## 快速开始
 

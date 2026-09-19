@@ -1,16 +1,30 @@
+# 仓库级忽略规则（同时覆盖 robot_dog_sdk/ 和 follow/）
+
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+.venv/
+venv/
+follow_env/
 
 # 本地临时产物
 tmp/
 *.log
+*.log.*
+core
+core.*
 
 # 编辑器 / AI 工具
 .claude/
 .vscode/
 .idea/
+*.swp
 
 # 系统
 Thumbs.db
 .DS_Store
+
+# 本机配置（不要提交）
+*_local.*
+*.local
