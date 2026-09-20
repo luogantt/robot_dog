@@ -16,6 +16,8 @@
      63  左侧移动  Y = +s
      68  右侧移动  Y = -s
       6  停止      全零
+      0  楼梯步态  切 0x1003（楼梯 · 常规模式）
+     69  基础步态  切 0x1001（基础 · 常规模式）—— 从楼梯切回来
 
     没检测到任何指令 tag  → 视为"停止"（看不见就不动）
 
@@ -78,21 +80,36 @@ def install_sigterm_as_interrupt():
         pass    # 非主线程调用时 signal.signal 会抛，忽略即可
 
 MOTION_RL = 17
+STATUS_STALE_S = 1.2        # 状态上报中断多久算断（BasicStatus 是 2Hz，容丢两帧）
 
 # 动作类型
 AXIS, GAIT, STOP = "axis", "gait", "stop"
 
-# tag id → (动作名, 类型, 轴/步态值, 符号)。幅度在下面按轴分别给（比例量 [-1,1]）。
+# tag id → (动作名, 类型, 轴/步态值, 带符号的幅度)。
+# 最终输出 = 这里的幅度 × 该轴 --mag × 该轴 --sign，所以改这个就是改
+# "这个动作能有多快"。
 TAG_ACTIONS = {
     1:  ("前进",      AXIS, "x",   +1.0),
-    18: ("后退",      AXIS, "x",   -1.0),
+    # 后退减半：相机装在【前部、朝前下方】，后退时狗看不到身后 —— 留出反应时间。
+    # 注意前进/后退共用 x 轴，但各有自己的幅度，所以 --mag-x 调的是两者共同的
+    # 倍率；要单独改后退就只改这一行。
+    18: ("后退",      AXIS, "x",   -0.5),
     3:  ("左转",      AXIS, "yaw", +1.0),
     61: ("右转",      AXIS, "yaw", -1.0),
     63: ("左侧移动",  AXIS, "y",   +1.0),
     68: ("右侧移动",  AXIS, "y",   -1.0),
     6:  ("停止",      STOP, None,   0.0),
-    0:  ("楼梯步态",  GAIT, None,   0.0),     # 步态值由 --stair-gait 决定
+    # GAIT 动作的第 3 个槽位放【目标步态值】（AXIS 动作那里放的是轴名）。
+    # 两个步态都是"常规模式"：切完 ControlUsageMode 仍是 0，比例轴指令继续有效。
+    # （别换成 0x3002/0x3003 那两个"导航模式"的 —— 会把模式切成 1，
+    #   §1.2.5 的比例轴指令随即失效，本状态机其他 tag 会全部失灵）
+    0:  ("楼梯步态",  GAIT, 0x1003, 0.0),     # 楼梯 · 常规模式
+    69: ("基础步态",  GAIT, 0x1001, 0.0),     # 基础 · 常规模式（从楼梯切回）
 }
+
+# 步态值 → 可读名（打印用）
+GAIT_NAMES = {0x1001: "基础(常规)", 0x1003: "楼梯(常规)",
+              0x3002: "平地(导航)", 0x3003: "楼梯(导航)"}
 
 # ⚠️ 楼梯步态有两个，后果完全不同：
 #     0x1003 楼梯（常规模式）—— 保持 ControlUsageMode=0，比例轴指令继续有效
@@ -225,15 +242,20 @@ def main():
     ap.add_argument("--tag-size", type=float, default=DEFAULT_TAG_SIZE_M)
     ap.add_argument("--hz", type=float, default=20.0, help="控制循环频率")
     ap.add_argument("--det-hz", type=float, default=15.0)
-    ap.add_argument("--lost-timeout", type=float, default=0.25,
-                    help="多久没有新检测就视为丢失并停止（秒）")
+    ap.add_argument("--lost-timeout", type=float, default=1.0,
+                    help="漏检宽限（秒）：这么久没再看到 tag 才停止；宽限内沿用上次"
+                         "命中的 tag 继续发指令。默认 1.0 是照【实测约 1s 的起步"
+                         "时间】定的 —— 宽限小于它的话，任何一次漏检都要重新爬坡，"
+                         "指令会碎成 0.1~0.3 秒的脉冲，狗迈不起步子")
     ap.add_argument("--min-px", type=float, default=20.0,
                     help="tag 最小像宽，挡掉远处小 tag 的误检")
     ap.add_argument("--stair-gait", type=lambda s: int(s, 0),
                     default=STAIR_GAIT_DEFAULT,
                     help=f"tag id=0 要切到的步态。默认 {hex(STAIR_GAIT_DEFAULT)}"
-                         f"（楼梯/常规模式）。改成 0x3003 会切到导航模式，"
-                         f"届时比例轴指令失效、其他 tag 全部失灵")
+                         f"（楼梯/常规模式）。⚠ 只影响 tag 0 —— 其余步态 tag"
+                         f"（如 tag 69 → 0x1001）的目标步态写在 TAG_ACTIONS 里。"
+                         f"改成 0x3003 会切到导航模式，届时比例轴指令失效、"
+                         f"其他 tag 全部失灵")
     ap.add_argument("--settle-s", type=float, default=0.3,
                     help="切步态前等机器人停稳的时间（§1.2.4 要求完全停止）")
     ap.add_argument("--gait-timeout", type=float, default=15.0,
@@ -270,16 +292,19 @@ def main():
           f"{'★ 真实控制 ★' if args.go else '干跑（只算不发）'}")
     print(f"tag_size={args.tag_size*1000:.1f}mm  最小像宽={args.min_px:.0f}px  "
           f"控制 {args.hz:.0f}Hz / 检测 ≤{args.det_hz:.0f}Hz  "
-          f"过期阈值 {args.lost_timeout*1000:.0f}ms")
+          f"漏检宽限 {args.lost_timeout*1000:.0f}ms  "
+          f"状态中断阈值 {STATUS_STALE_S*1000:.0f}ms")
     print("动作表：")
     for tid in sorted(TAG_ACTIONS):
         name, kind, axis, s = TAG_ACTIONS[tid]
         if kind == STOP:
             print(f"   id={tid:<3d} {name:<8s} 全零")
         elif kind == GAIT:
-            g = args.stair_gait
+            # tag 0 的目标步态可用 --stair-gait 覆盖；其余 GAIT tag 用表里的值
+            g = args.stair_gait if tid == 0 else axis
             mode = "常规" if g in (0x1001, 0x1003) else "导航"
-            print(f"   id={tid:<3d} {name:<8s} 切步态 {hex(g)}（{mode}模式）"
+            print(f"   id={tid:<3d} {name:<8s} 切步态 {hex(g)}"
+                  f"（{GAIT_NAMES.get(g, '?')}）"
                   f"  ← 先停稳再切（§1.2.4）")
             if mode == "导航":
                 print("        ⚠️ 导航步态会把使用模式切成 1，"
@@ -287,7 +312,8 @@ def main():
         else:
             eff = s * sign[axis] * mag[axis]
             print(f"   id={tid:<3d} {name:<8s} {axis} = {eff:+.3f}"
-                  f"   (幅度 {mag[axis]} × 符号 {sign[axis]:+.0f})")
+                  f"   (动作 {s:+.2f} × 幅度 {mag[axis]:.2f} "
+                  f"× 符号 {sign[axis]:+.0f})")
 
     det_thread = None
     t_start = time.monotonic()
@@ -357,16 +383,28 @@ def main():
             else:   # GAIT —— 步态切换子状态机
                 # §1.2.4：步态切换必须在机器人【完全停止】后下发，否则指令
                 # 被缓存、停稳后才执行。所以分三段走：停稳 → 下发 → 等生效。
-                tg = args.stair_gait
+                # GAIT 动作的第 3 槽位放的是目标步态值（AXIS 动作放轴名）。
+                tg = axis
+                label = name          # 保留动作名；下面的 name 会被子状态覆盖
+                # ⚠️ 目标变了必须重跑整个流程 —— 否则从 tag 0（已 done）直接换到
+                #    tag 69 时 gait_phase 还是 "done"，一个分支都不进，静默失效。
+                if tg != gait_target:
+                    gait_phase, gait_target = "idle", tg
+                # 已经在目标步态就不用再走一遍"停稳→切换"
+                if gait_phase == "idle" and link.gait == tg:
+                    gait_phase = "done"
+                    log_state(f"{label}：已经在 {hex(tg)}"
+                              f"（{GAIT_NAMES.get(tg, '?')}），无需切换")
                 if gait_phase == "idle":
                     gait_phase, gait_t0 = "settling", now
-                    log_state(f"楼梯步态：先停稳（{args.settle_s:.1f}s）再切")
+                    log_state(f"{label}：先停稳（{args.settle_s:.1f}s）"
+                              f"再切 {hex(tg)}（{GAIT_NAMES.get(tg, '?')}）")
                 if gait_phase == "settling":
-                    name = "楼梯步态·停稳中"
+                    name = f"{label}·停稳中"
                     if now - gait_t0 >= args.settle_s:
                         gait_phase, gait_t0 = "switching", now
                 if gait_phase == "switching":
-                    name = f"楼梯步态·切换中({hex(link.gait or 0)}→{hex(tg)})"
+                    name = f"{label}·切换中({hex(link.gait or 0)}→{hex(tg)})"
                     # 每 0.5s 重发一次 —— 轴指令无响应帧、丢包静默，只能靠重发
                     if now - gait_sent_t > 0.5:
                         if args.go:
