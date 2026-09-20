@@ -92,6 +92,78 @@ python web_control.py --host 192.168.1.50 --port 30004
 
 ---
 
+### 1.3 部署在机器狗本机（推荐做法）
+
+> **实际生产用的就是这个方式**，不是跑在外部电脑上。
+
+**Web 遥控不需要相机**，所以可以直接部署到机器人本体 `.103`。
+这样做 ASDU 走 `127.0.0.1` **本地通信**，跨网络的路由 / 多网卡 / 源端点冲突
+（§1.5 的 `0xE006` 要求 2 秒内轴指令同源）**在结构上就不存在了**。
+
+#### 代码位置
+
+```
+.103  (user@10.21.33.103)
+├── /home/user/robot_dog_web/          ← 程序
+│   ├── web_control.py                 主程序（FastAPI + 20Hz 控制循环）
+│   ├── asdu_udp_control.py            协议层 + RobotClient
+│   ├── web/                           前端 index.html / app.js / style.css
+│   ├── start_web.sh                   ★ 启动
+│   ├── stop_web.sh                    ★ 停止
+│   ├── web.log                        日志（查问题看这个）
+│   ├── web.pid                        PID 文件
+│   ├── axis_test.py                   轴指令测试工具
+│   └── local_axis_check.py            本机状态/轴指令检查（纯标准库）
+└── /home/user/web_env/                ← Python 环境
+    └── bin/python                     fastapi / uvicorn / websockets
+```
+
+#### 启停
+
+```bash
+ssh user@10.21.33.103
+cd /home/user/robot_dog_web
+
+./start_web.sh     # 启动（会先自检，再启动，最后确认连上机器人）
+./stop_web.sh      # 停止
+```
+
+`start_web.sh` 做的事：检查 Python 环境 / 程序文件 / 依赖 / 端口占用 →
+启动 → 等它连上机器人（最多 12 秒）→ 打印访问地址和操作提示。
+**它不会只报"进程起来了"就算成功** —— 会 grep 日志确认"已连上机器人"。
+
+浏览器打开 **`http://10.21.33.103:8000`**。
+
+#### 首次部署（换机器时）
+
+```bash
+# ① 建环境（Ubuntu 24.04 有 PEP 668，不能直接 pip 装系统环境）
+python3 -m venv /home/user/web_env
+/home/user/web_env/bin/pip install -i https://pypi.mirrors.ustc.edu.cn/simple \
+    fastapi uvicorn websockets
+
+# ② 传程序（在本地 Git Bash，见第 10 节的上传方法）
+mkdir -p /home/user/robot_dog_web/web
+# 上传 web_control.py / asdu_udp_control.py / web/ / deploy/*.sh
+
+# ③ 启动
+cd /home/user/robot_dog_web && ./start_web.sh
+```
+
+#### 另一台机器：相机与跟随（`.102`）
+
+**跟随 / Tag 指令状态机必须在 `.102`** —— 因为**相机（D435i）装在那台上**。
+
+```
+.102  (ysc@10.21.33.102)
+├── /home/ysc/tag_probe/      ← 跟随程序 + 状态机 + tag 图
+└── /home/ysc/follow_env/     ← Python 环境（dt_apriltags + cv2）
+```
+
+详见 [`../follow/QUICKSTART.md`](../follow/QUICKSTART.md)。
+
+---
+
 ## 2. 三种用法
 
 | 入口 | 用途 |
@@ -151,10 +223,42 @@ python asdu_udp_control.py
 
 > **真正的安全手段是机器人本体的物理急停按钮。** 软件急停不能替代人在现场看护。
 
-### 4.2 使用网页遥控时，请关闭手机 App 的手动控制
+### 4.2 ⚠️ 同一时刻只能有一个「轴指令发送源」
 
 文档 §1.5 的 `0xE006`：**"轴指令发送时，要求 2s 内发送的指令来自同一个客户端"**。
-手机 App 和网页在同一个 2s 窗口内发轴指令会互相踢掉，表现为"指令偶尔没反应"，极难排查。
+两个以上发送源同时在发 → **互相踢掉 → 谁的指令都不生效**。
+
+**这条比看起来严重得多，而且很容易自己踩自己。** 下面这些都是「不同的发送源」：
+
+| 发送源 | 说明 |
+|---|---|
+| `web_control.py`（本 SDk） | **无论有没有人按键，它都以 20Hz 持续发轴指令**（空闲时发 `X=0 Y=0 Yaw=0`） |
+| 官方手柄 | |
+| 手机 App（golai） | |
+| `axis_test.py` / `local_axis_check.py` 等测试脚本 | **每运行一次就是一个新客户端** |
+| 跟随程序 / Tag 指令状态机 | |
+
+#### 症状：只有「站立/趴下」能用，前进/转向完全没反应
+
+**这是最典型的 `0xE006` 冲突表现**，因为：
+
+- **站立 / 趴下 / 步态切换** 走 `send_and_wait()` **单次请求** → **不参与 2 秒同源竞争** → 永远能用
+- **前进 / 后退 / 转向** 走 §1.2.5 轴指令通道 → **被踢掉，且静默无任何报错**
+
+> **实测**（2026-09-20）：手柄和 App 都连着时，网页发 `X=0.5` 两秒，机器人
+> `LinearX` 只有 **0.022 m/s**（几乎没动）；关掉手柄/App 后同一条指令
+> → **0.86 m/s**。差 40 倍。
+
+#### 规则
+
+| 你要做什么 | 必须先 |
+|---|---|
+| 用网页遥控 | **关掉手柄、关掉手机 App 的手动控制** |
+| 跑测试脚本（`axis_test` 等） | `./stop_web.sh` **先停掉 web 服务** |
+| 跑跟随 / 状态机 | 同上 |
+| 反过来：网页遥控时用测试脚本？ | **不行** —— 两者只能留一个 |
+
+**排查口诀**：只要出现「动作能、轴指令不能」，第一件事就是**数一下有几个发送源**。
 
 ### 4.3 文档里没有"上高台/越障"步态
 
