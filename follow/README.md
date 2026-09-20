@@ -81,21 +81,59 @@ cd /home/ysc/tag_probe
 
 ## 2. 快速开始
 
+### 用部署脚本（推荐）
+
 ```bash
-# 在 .102 上
 ssh ysc@10.21.33.102
 cd /home/ysc/tag_probe
+
+./deploy_start.sh              # 启动（默认 Tag 指令状态机）
+./deploy_start.sh --follow     # 启动跟随模式
+./deploy_start.sh --dry        # 干跑：只检测，不发任何指令
+./deploy_stop.sh               # 停止（先让狗趴下，再停程序）
+```
+
+`deploy_start.sh` 会**先做五项检查**，任一不过就拒绝启动：
+
+```
+  ✓ Python 环境   /home/ysc/follow_env/bin/python
+  ✓ 程序目录     /home/ysc/tag_probe
+  ✓ 相机话题     域 2 可见
+  ✓ 冲突检查     10.21.33.103:8000 没有 Web 遥控在跑
+  ✓ 机器人       MotionState=17 (RL控制)
+```
+
+| 检查 | 不过时的提示 |
+|---|---|
+| Python 环境 / 程序目录 | 直接报缺哪个 |
+| **相机话题** | 会告诉你查 `systemctl status realsense-camera.service` |
+| **冲突检查** | ⚠️ **`.103` 上的 Web 遥控是另一个轴指令发送源**，两边会互相踢（`0xE006`）。检测到就拒绝启动，并给出停它的命令 |
+| **机器人状态** | 不是 `MotionState=17` 就拒绝，并给出起立命令 |
+
+**`deploy_stop.sh` 的行为是刻意的**：
+
+```
+ ① 先让狗趴下（避免留下"站着没人管"的状态）...
+  ✓ 狗已趴下
+ ② 停止程序...  ✓ 已优雅停止（程序已连发归零）
+```
+
+**先趴下 → 确认到位 → 才停程序。** 反过来的话程序一停就没人管狗了；
+万一趴下失败，脚本会**直接返回、程序不停**，状态仍然可控。
+确认狗安全之后可以直接停：`./deploy_stop.sh --no-crouch`
+
+### 手动跑（不用脚本）
+
+```bash
+cd /home/ysc/tag_probe
 source /opt/ros/jazzy/setup.bash
-export ROS_DOMAIN_ID=2
+export ROS_DOMAIN_ID=2          # ← 相机在域 2，不设就看不到图像
 
-# 干跑（只算不发，安全）—— 先确认能检测到 tag
-/home/ysc/follow_env/bin/python tag_command_fsm.py
-
-# 真跑（会真的指挥狗）
+/home/ysc/follow_env/bin/python tag_command_fsm.py            # 干跑
 /home/ysc/follow_env/bin/python tag_command_fsm.py --go --duration 120
 ```
 
-**然后拿着 tag 在狗前面出示即可。**
+**然后拿着 tag 在狗前面出示即可**（位置要求见 §3）。
 
 ---
 
@@ -124,6 +162,8 @@ export ROS_DOMAIN_ID=2
 
 | 文件 | 干什么 | 常用命令 |
 |---|---|---|
+| **`deploy_start.sh`** | **启动**（五项检查 + 启动 + 确认） | `./deploy_start.sh [--follow\|--dry]` |
+| **`deploy_stop.sh`** | **停止**（先让狗趴下再停程序） | `./deploy_stop.sh [--no-crouch]` |
 | **`tag_command_fsm.py`** | **主程序**：tag id → 动作 | `... --go --duration 120` |
 | `follow_controller.py` | 跟随模式：追着 tag 走，停在 1 米 | `... --go --max-wz 0` |
 | `motion_cmd.py` | 起立/趴下/切步态 | `... --stand --go` |
@@ -245,11 +285,32 @@ ros2 topic hz /camera/camera/color/image_raw
 1. **本程序的"停止"是软件零速，不是硬件急停。** 文档 §1.2.3 明确：软急停(-2)
    仅支持查询、**不支持下发** —— **这份协议里没有任何急停指令**。
    **真正的安全手段是机器人本体的物理急停按钮。**
+   （`./deploy_stop.sh` 会让狗先趴下再停程序，但这仍不是急停。）
 2. **⚠️ `Yaw = ±1.0` 是满量程转向（≈86°/s），狗会猛地转头。** 场地要留够。
 3. **不要和其他客户端同时控制。** 文档 §1.5 的 `0xE006` 要求轴指令 2 秒内同源
    —— 手机 App / 手柄同时控制会互相踢掉，表现为"指令偶尔没反应"。
 4. **轴指令不返回任何响应帧**，失败是静默的。唯一的判据是机器人的实际状态反馈。
 5. **总有人在场看护。** 场地清空，手放断电位置。
+6. ⚠️ **同一时刻只能有一个「轴指令发送源」**（文档 §1.5 的 `0xE006`：
+   轴指令要求 2 秒内来自同一个客户端）。下面这些都是**各自独立的发送源**：
+
+   | 发送源 | |
+   |---|---|
+   | 本项目的跟随 / 状态机 | |
+   | **`.103` 上的 Web 遥控** | **`web_control` 无论有没有人按键都以 20Hz 持续发轴指令** |
+   | 官方手柄 / 手机 App | |
+   | `axis_test.py` 等测试脚本 | 每跑一次就是一个新客户端 |
+
+   **两个以上同时在发 → 互相踢 → 谁的指令都不生效。**
+
+   **症状**：只有**站立/趴下**能用，**前进/转向完全没反应** —— 因为前者走
+   `send_and_wait` **单次请求**不参与 2 秒同源竞争，后者会被**静默踢掉**。
+
+   > **实测**（2026-09-20）：手柄和 App 都连着时发 `X=0.5` 两秒，
+   > 机器人 `LinearX` 只有 **0.022 m/s**；关掉后同一条指令 **0.86 m/s**，**差 40 倍**。
+
+   **`deploy_start.sh` 会自动检查这一条**：探测到 `.103:8000` 有 Web 遥控在跑就拒绝启动。
+   **排查口诀**：出现「动作能、轴指令不能」，第一件事是**数有几个发送源**。
 
 ---
 
