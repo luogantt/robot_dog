@@ -26,8 +26,12 @@
 
 安全
 --------------------------------------------------------------------------
-  · 目标过期（--lost-timeout 内没有新检测）→ 视为丢失 → 归零
-  · 不在 RL 控制(17) / 状态中断 → 归零
+  · tag 漏检在 --lost-timeout 内 → 沿用最后一次命中的位置（宽限期，防止
+    指令被切成碎片）；超出宽限或从未检测到 → 归零
+  · 状态上报中断 > STATUS_STALE_S，或不在 RL 控制(17) → 归零
+    ⚠ 判据必须是【上报新鲜度】，不能只看 motion_state 的值 —— 通信断了
+      这个变量会永远停在最后一个值（比如 17），程序会以为机器人还在线，
+      继续下发运动指令。这是实测踩过的坑。
   · 速度上限 + 变化率限幅（在 follow_law 里）
   · Ctrl+C / 异常 → finally 里连续归零
 """
@@ -82,28 +86,42 @@ def detect_one(det, gray, fx, fy, cx0, cy0, tag_size, want_id):
 
 
 class SharedTarget:
-    """线程1 写、线程2 读的"最新目标"。带时间戳，供过期判断。"""
+    """线程1 写、线程2 读的"最新目标"。
+
+    ★ 两个时间戳必须分开存（这里踩过，代价很大）★
+        frame_ts —— 检测线程最后一次【处理完一帧】的时间。只反映线程活没活。
+        good_ts  —— 最后一次【真的看到 tag】的时间。过期判断要用这个。
+
+    原先只有一个 ts，而漏检帧也会刷新它（put(None, ...)），于是 --lost-timeout
+    实际只检测"检测线程卡死"，想要的"漏检宽限"从来没生效过 —— 漏一帧就立刻
+    归零。实测代价：命中率 8% 时指令被切成 0.1~0.3 秒的碎片，而机器人需要约
+    1 秒连续指令才能起速，狗只会抽动、走不起来（见 TECHNICAL_REPORT §2.7）。
+    """
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.pos = None          # (前, 左, 上) 米，机体系
-        self.normal = None       # (nx, ny) 单位向量
-        self.ts = 0.0
+        self.pos = None          # 本帧位置 (前,左,上) 米；漏检帧为 None
+        self.good_pos = None     # 最后一次命中的位置，供漏检宽限期沿用
+        self.frame_ts = 0.0
+        self.good_ts = 0.0       # 0 = 从未检测到
         self.seq = 0             # 已处理的检测帧数
         self.frames = 0          # 已处理的相机帧数
         self.hits = 0
         self.det_ms = 0.0
         self.last_why = "启动中"
 
-    def put(self, pos, normal, now, det_ms):
+    def put(self, pos, now, det_ms):
         with self.lock:
-            self.pos, self.normal, self.ts = pos, normal, now
+            self.pos, self.frame_ts = pos, now
+            if pos is not None:
+                self.good_pos, self.good_ts = pos, now
             self.seq += 1
             self.det_ms = det_ms
 
     def get(self):
         with self.lock:
-            return self.pos, self.normal, self.ts, self.seq, self.det_ms
+            return (self.pos, self.good_pos, self.frame_ts, self.good_ts,
+                    self.seq, self.det_ms)
 
     def bump_frame(self, hit):
         with self.lock:
@@ -208,7 +226,8 @@ def main():
     print(f"tag id={cfg.tag_id}  size={args.tag_size*1000:.1f}mm  "
           f"目标距离={args.target:.2f}m")
     print(f"控制 {args.hz:.0f}Hz / 检测 ≤{args.det_hz:.0f}Hz，"
-          f"目标过期阈值 {args.lost_timeout*1000:.0f}ms")
+          f"漏检宽限 {args.lost_timeout*1000:.0f}ms，"
+          f"状态中断阈值 {STATUS_STALE_S*1000:.0f}ms")
 
     det_thread = None
     t_start = time.monotonic()

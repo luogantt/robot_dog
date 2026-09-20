@@ -27,36 +27,39 @@ import numpy as np
 class FollowConfig:
     tag_id: int = 1
     target_dist_m: float = 1.0      # 目标地面距离
-    # 速度上限按【实测标度】定：指令 0.06 持发 3.0s → 尺子量得 0.33m
-    # （与 LinearX 逐帧积分出的 33cm 完全一致 → 反馈可当实测值用）。
-    # 扣掉约 0.4s 起步加速 → 稳态 ≈ 0.127 m/s，满量程 ≈ 2.1 m/s。
-    # 所以 max_vx=0.12 大约是 0.25 m/s。
-    # （§1.2.6 标的 ±1.67 m/s 是真实轴指令的量程，和这里不是一回事，别混用）
-    max_vx: float = 0.12            # 前进比例量上限 ≈ 0.25 m/s
+    # 速度上限。标度用 2026-09-20 的直连实测（见 TECHNICAL_REPORT §2.7）：
+    #   指令 X=0.5 持发 1.5s → LinearX 稳态 0.857 m/s  →  满量程 ≈ 1.71 m/s
+    #   实测序列 0.170(0.25s) → 0.395(0.50s) → 0.723(0.80s) → 0.857(1.10s)
+    #   —— 单调爬升、稳态明确，且 1.71 与 §1.2.6 标的 ±1.67 m/s 吻合。
+    #   ⇒ 这条通道是【线性】的，可以用比例控制。
+    # 所以 max_vx = 0.50 ≈ 0.86 m/s，约为人正常步速的 2/3。
+    #
+    # 【旧值 0.12 是错的，别再改回去】它按"指令 0.06 → 0.127 m/s"推的标度，
+    # 而那个读数是在【源端点被污染】的环境下拿到的（本机两条等价路由 →
+    # 不同 socket 拿到不同源 IP → 多个客户端互相抢控制权），不是通道特性。
+    # 按旧值只有 0.2 m/s —— 之前记的"前进响应弱、追不上人"就是这个造成的，
+    # 不是机器人不给力。详见 TECHNICAL_REPORT §2.7。
+    max_vx: float = 0.50            # 前进比例量上限 ≈ 0.86 m/s（实测标度）
     # 转向：实测 Yaw 通道【非单调】—— 0.5 → 21°，0.8 → 1.4°，1.0 → 180°。
     # 中间值不可用，只有满量程能可靠起转。所以默认用开关式（bang-bang）
     # 而不是比例式，绕开整条失效区间。
     max_wz: float = 1.00            # 满量程 —— 唯一实测有效的值
     yaw_bangbang: bool = True       # True=开关式；False=比例式(仅调试用)
     yaw_deadband_deg: float = 8.0   # 方位误差小于这个角度就不转向，防抖
-    # 目标点是否沿 tag 法向量偏移 1 米（需求原话）。
-    # 默认【关】。原因有二，都是仿真实测出来的：
+    # 【已移除】沿 tag 法向量偏移目标点的方案（2026-09-20 删除）。
+    # 需求原话是 T = tag位置 + target × n（n = tag 法向量），实测两个问题：
     #  1) 法向量的 EMA 滤波会形成正反馈：狗一转身 → 滤波滞后 → 目标点
     #     永远偏在死区外 → 无限原地打转。15Hz 下滞后 12.7°，调参修不掉。
     #  2) 转向通道本身不可靠（只有满量程能起转，起转时刻不可预测）。
-    # 关掉后狗"直接朝 tag 走到 1 米"，同样满足"距 tag 1 米"这个目标，
-    # 且几乎不需要转向。代价：不会自动站到 tag 正前方（离理想点 0.24~0.72m）。
-    use_tag_normal: bool = False
+    # 于是改为恒定的"直接朝 tag 走到 target 距离" —— 同样满足"距 tag 1 米"
+    # 这个目标，且几乎不需要转向。代价：不会自动站到 tag 正前方。
+    # 若将来要重新引入，先看 TECHNICAL_REPORT §2.4 的符号坑。
     kp_dist: float = 1.0            # 前向误差(m) → 速度比例
     kp_yaw: float = 1.2             # 方位角(rad) → 角速度比例
     pos_deadband_m: float = 0.10    # 距目标点这么近就不再前进
-    lost_timeout_s: float = 0.0     # 0=丢一帧即停(严格)；>0=宽限期内保持上条指令
     jump_limit_m: float = 0.60      # 单帧距离突变上限
     max_yaw_rate_hz: float = 3.0    # 转向变化率限幅（比例量/秒）
     max_accel_hz: float = 2.0       # 前进变化率限幅（比例量/秒）
-    normal_ema_alpha: float = 0.30  # 法向量低通系数(0~1)，越小越平滑
-                                    # 实测 tag 只有 34px 时，静止 tag 的法向
-                                    # 横向分量会抖 ±0.2 → 不滤的话转向会抖
 
 
 class FollowController:
@@ -87,16 +90,15 @@ class FollowController:
         self.last_t = now
 
         # --- 1) 看不见 → 不动 ---
+        # 漏检宽限【不在这里做】。它在 follow_controller 的 I/O 层：那里才拿得到
+        # "最后一次真的看到 tag"的位置，宽限期内沿用该位置继续闭环（比冻结上一条
+        # 指令好：狗移动后几何依然大致成立）。本函数保持纯函数 —— pos_body is None
+        # 就是"不要动"，所以可以离线单元测试。
         if pos_body is None:
-            if (c.lost_timeout_s > 0 and self.last_seen_t > 0
-                    and now - self.last_seen_t <= c.lost_timeout_s):
-                self.reason = f"丢失宽限 {now - self.last_seen_t:.2f}s"
-                return self.last_vx, self.last_wz, self.reason
             self.reason = "看不见 → 停"
             self.last_vx = self.last_wz = 0.0
             return 0.0, 0.0, self.reason
 
-        self.last_seen_t = now
         P = np.array([float(pos_body[0]), float(pos_body[1])])
         dist = float(np.linalg.norm(P))
 
