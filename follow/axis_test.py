@@ -93,6 +93,9 @@ class Link:
     def __init__(self, host, port):
         self.target = (host, port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # 必须显式绑定 —— Windows 上未绑定的 UDP socket 直接报 WinError 10022
+        # （Linux 不会）。而且这个端口决定 0xE006 的客户端身份，全程要用同一个 socket。
+        self.sock.bind(("0.0.0.0", 0))
         self.sock.settimeout(0.05)
         self.motion_state = None
         self.faults = []

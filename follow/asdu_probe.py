@@ -78,6 +78,10 @@ def main():
     args = ap.parse_args()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # 必须显式绑定：Linux 上未绑定的 UDP socket 也能 getsockname()（返回 0.0.0.0:0），
+    # 但 Windows 上会直接抛 WinError 10022。绑到 0 号端口让内核分配。
+    # 这个端口也决定了 0xE006 的"客户端身份"，整个会话必须用同一个 socket。
+    sock.bind(("0.0.0.0", 0))
     sock.settimeout(0.3)
     target = (args.host, args.port)
 
