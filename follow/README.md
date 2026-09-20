@@ -1,244 +1,298 @@
-# follow —— 机器狗 AprilTag 追踪
+# follow —— 相机识别 tag，指挥机器狗动作
 
-让山猫 S10 机器狗追踪 AprilTag，保持在 **1 米**距离。
+用 `.102` 上的 **Intel RealSense D435i** 实时检测 AprilTag，根据 **tag 的 id**
+让机器狗执行对应动作（前进/后退/转向/侧移/停止/切步态），或者**跟着 tag 走**。
 
-```
-距离 > 1m + 死区  →  前进（速度按距离比例）
-距离在 1m ± 死区  →  停
-距离 < 1m         →  停（不倒退）
-同时转向对准 tag
-```
+> 本文是**运行手册**。设计原理、实测标定、踩过的坑见
+> [`../TECHNICAL_REPORT.md`](../TECHNICAL_REPORT.md) 第 2 节。
 
 ---
 
-## 1. 硬件拓扑
+## 0. 硬件前提（先看懂这张表，否则后面全是坑）
 
-机器狗上有**两台计算机**：
+机器狗上挂着**两台独立的计算机**：
 
-| 地址 | 用户 | 角色 | 关键内容 |
-|---|---|---|---|
-| **10.21.33.103** | `user` | 主控计算机 | `robotserve`（ASDU UDP 30004）、`golai` 网页遥控（8088/8089）、8 个 USB 鱼眼相机 |
-| **10.21.33.102** | `ysc` / `lg` | Jetson 伴侣计算机 | **Intel RealSense D435i**、激光雷达、ROS2 Jazzy、Docker |
-
-**追踪用 `.102` 上的 RealSense**，控制指令走 `.103` 的 ASDU UDP。
-
-SSH 密码：**见内部记录，不写进仓库**。`.102` 上 `ysc` 有**免密 sudo**。
-
----
-
-## 2. 相机配置（重要）
-
-### 2.1 当前使用的配置
-
-| 项目 | 值 |
-|---|---|
-| 型号 | **Intel RealSense D435i**（序列号 347622073366，固件 5.15.1.55） |
-| 彩色流 | **640×480 RGB8 @15fps** ✓ 稳定 |
-| 深度流 | **已关闭**（带宽不够，见下） |
-| 红外 / IMU | **已关闭** |
-| 话题 | `/camera/camera/color/image_raw` |
-| 内参话题 | `/camera/camera/color/camera_info` |
-
-### 2.2 相机内参（已验证）
-
-```
-fx = 603.3994140625     fy = 602.9302368164062
-cx = 330.577880859375   cy = 251.92457580566406
-
-畸变系数 D = [0.0, 0.0, 0.0, 0.0, 0.0]      ← 全零 = 已做畸变校正
-畸变模型 distortion_model = "plumb_bob"
-坐标系 frame_id = "camera_color_optical_frame"
-```
-
-**有了内参就能算真实的 3D 距离** —— 不需要再靠"像宽反比"估距离，
-也不需要手工标定。直接用 dt-apriltags 的 `estimate_tag_pose(camera_params, tag_size)`。
-
-### 2.3 ⚠️ 为什么必须用低带宽配置
-
-原配置是 **1280×720 RGB@30 + 848×480 深度@30 + 双红外@30**，
-这个带宽超出 Jetson USB 控制器的能力，表现为：
-
-```
-usb 2-3.1: USB disconnect, device number 40
-tegra-xusb ERROR Transfer event TRB DMA ptr not part of current TD ep_index 6
-usb 2-3.1: new SuperSpeed USB device number 41     ← 又枚举一遍
-```
-
-设备号 **39 → 40 → 41 反复递增**，相机在断开/重连死循环里，**节点虽然活着但一帧都发不出来**。
-`dmesg` 里累计 **33 次 USB disconnect**。
-
-**降到只开彩色 640×480@15 后稳定。**
-
-### 2.4 启动相机
-
-```bash
-ssh ysc@10.21.33.102      # 密码见内部记录
-
-# 先清掉卡死的旧进程
-pkill -9 -f realsense2_camera_node; sleep 4
-
-source /opt/ros/jazzy/setup.bash
-cd ~
-setsid nohup ros2 run realsense2_camera realsense2_camera_node --ros-args \
-  -p enable_color:=true -p enable_depth:=false \
-  -p enable_infra1:=false -p enable_infra2:=false \
-  -p enable_gyro:=false -p enable_accel:=false \
-  -p rgb_camera.color_profile:=640x480x15 \
-  > /tmp/rs2.log 2>&1 < /dev/null &
-
-# 等约 20 秒，验证
-source /opt/ros/jazzy/setup.bash
-ros2 topic hz /camera/camera/color/image_raw
-```
-
-**验证成功的标志**（`/tmp/rs2.log` 里）：
-
-```
-Open profile: stream_type: Color(0), Format: RGB8, Width: 640, Height: 480, FPS: 15
-RealSense Node Is Up!
-```
-
-> **注意**：`setsid nohup ... &` 这种后台启动，通过 SSH 执行时不要读取该命令的输出
-> （后台进程会占住通道的 stdout，导致读取阻塞超时）。发射后不管即可。
-
----
-
-## 3. tag 信息
-
-| 项目 | 值 |
-|---|---|
-| 家族 | **`tagStandard41h12`** |
-| ID | **1** |
-| 官方原图 | https://github.com/AprilRobotics/apriltag-imgs/blob/master/tagStandard41h12/tag41_12_00001.png |
-| 布局 | 9×9 模块（约 4.5×4.5cm，视打印尺寸而定） |
-
-**家族确认过程**：文件名 `tag41_12_00001.png` 与官方 `apriltag-imgs` 仓库的命名规则一致
-（`tag41_12_` = `tagStandard41h12`）。
-
-⚠️ **`cv2.aruco` 不支持这个家族**（只有 16h5 / 25h9 / 36h10 / 36h11），必须用 `dt-apriltags` 或 `pupil-apriltags`。
-
-⚠️ **打印注意**：尺寸尽量大（A4 打满）、四周留白边（quiet zone ≥ 1 格）、
-**别用光泽相纸**（反光会让 tag 变白）、贴平不要卷曲。
-
----
-
-## 4. 运行环境
-
-### 4.1 检测库（装在 .103 上）
-
-```bash
-# Ubuntu 24.04 有 PEP 668 保护，不能直接 pip 装系统环境 → 必须用 venv
-python3 -m venv --system-site-packages /home/user/follow_env
-/home/user/follow_env/bin/pip install -i https://pypi.mirrors.ustc.edu.cn/simple dt-apriltags
-```
-
-依赖说明：
-- `--system-site-packages`：继承系统里已有的 `cv2` 4.6.0
-- 用**中科大镜像**（清华/阿里/github 在这台机器上不通，百度通 = 有外网）
-- `dt-apriltags` 有**预编译的 aarch64 轮子**，不用编译
-
-> **踩过的坑**：
-> 1. Ubuntu 24.04 的 **PEP 668** 禁止直接 `pip install` 到系统环境
-> 2. 循环里反复创建 `Detector` 对象会让底层 C 库 **malloc 崩溃**
->    （`malloc(): mismatching next->prev_size`）→ **每个家族单独开进程**
-
-### 4.2 读相机权限（.103）
-
-`.103` 上的 `user` **不在 `video` 组**，读 `/dev/video*` 需要 sudo。
-
-```bash
-sudo usermod -aG video user     # 然后重新登录
-```
-
-`.102` 上的 `ysc` 已经在 `video` 和 `plugdev` 组里，设备是 `crw-rw-rw-`，**不用 sudo**。
-
----
-
-## 5. 运行追踪程序
-
-```bash
-# 在 .103 上（控制指令发给 127.0.0.1:30004）
-python3 tag_follower.py --camera 6                 # 干跑：只检测不发指令
-python3 tag_follower.py --camera 6 --go            # 真实控制
-python3 tag_follower.py --camera 6 --calib         # 测距标定模式
-```
-
-**干跑模式不检查 RL 控制状态**，方便狗趴着时单独调检测；
-**`--go` 模式会检查**，未进入 `MotionState=17` 直接拒绝运行。
-
-### 五道安全
-
-| 机制 | 说明 |
-|---|---|
-| tag 丢失 | 超过 `LOST_TIMEOUT_S`(0.5s) 立即输出归零 |
-| 距离突变 | 单帧变化 > `JUMP_LIMIT_M`(0.6m) 丢弃该帧 |
-| 速度限幅 | `MAX_VX=0.35`、`MAX_WZ=0.45` |
-| RL 门禁 | `--go` 时未处于 RL 控制(17) 拒绝运行 |
-| 异常归零 | `finally` 里必发零速 |
-
----
-
-## 6. 控制通道
-
-用 **ASDU UDP → `127.0.0.1:30004`**，理由：
-
-- 已实测可用（`robot_dog_sdk` 那套验证过）
-- 机器狗自己的 `golai` 网页遥控（8088）也走这条
-- ROS2 那条路走不通：**`drdds` 消息包里没有 `NavCmd`**（文档 §2.3.1 写的类型不存在）
-
-⚠️ **不要和其他客户端同时控制** —— 文档 §1.5 的 `0xE006` 要求轴指令 2 秒内同源，
-`golai` 遥控器和本程序同时跑会互相踢掉。
-
----
-
-## 7. 待办 / 已知问题
-
-### 7.1 阻塞项：相机里看不到有效 tag
-
-之前相机拍到的是一张**网格状小标记的纸**，但：
-
-- 单个标记太小（1 米外像宽可能只有十几像素）
-- **纸是卷曲的**（包在横杆上）
-- 拍出来很糊
-
-试过 **4 个 tag 家族 × 12 组鱼眼畸变矫正 × 多组检测参数**，**全部 0 命中**。
-判断：**那张纸上的图案不是可解码的 AprilTag**。
-
-**→ 需要用官方原图重新打印一张，贴平、贴大。**
-
-### 7.2 tag 位姿话题是"空壳"
-
-`.102` / `.103` 上都有这两条话题，但**没有任何数据**：
-
-| 话题 | 类型 | 状态 |
+| 地址 | 账户 | 有什么 |
 |---|---|---|
-| `/pose_in_apriltag_corrected` | `geometry_msgs/msg/PoseStamped` | 有发布者，**无数据** |
-| `/tag_status` | `drdds/msg/StdMsgInt32` | 有发布者，**无数据** |
-
-**原因**：发布它们的 `s10_sdk_deploy`（`lg` 用户的自研 RL 部署节点）**崩溃了**：
+| **10.21.33.102** | `ysc` | **相机在这里**（D435i）、ROS 2 Jazzy、`follow_env` 环境 |
+| **10.21.33.103** | `user` | **运控在这里**（ASDU 服务端，UDP 30004） |
 
 ```
-/home/lg/goai_embodied_future_material/core    ← 285MB coredump，2026-09-18 18:33
-from '/home/user/goai_embodied_future_material/install/s10_sdk_deploy/...'
+D435i（.102）→ 检测 tag → 控制律 → ASDU UDP → 运控（.103）→ 狗动
 ```
 
-`lg` 的 bash_history 显示他在跑 `ros2 run s10_sdk_deploy rl_deploy`。
-
-**→ 如果要复用这套 tag 管线，得先让它别崩。但本项目的检测是独立实现的，不依赖它。**
-
-### 7.3 其它
-
-- **RealSense 历史上掉线 33 次**，低带宽配置目前稳；再掉线就重启节点
-- `.103` 的 ROS 图像话题（`/usb_camera_1/image_raw` 等）**全部没有数据**
-- `.102` 上有 **12 个 ROS 域**在跑（`mcast_relay` 搭的），但只有 **domain 0** 有真实话题
-- `.102` 上还有第三个用户 `lg`，其 `~/goai_embodied_future_material` 是**自研工程**（从竞赛仓库改的），`ysc` 需要 `sudo` 才能读
+**所有程序都跑在 `.102` 上**，通过 UDP 把指令发给 `.103`。
 
 ---
 
-## 8. 相关文件
+## 1. 前置条件（四条，缺一条就跑不起来）
 
-| 文件 | 说明 |
+### ① 两台机器都通
+```bash
+ping 10.21.33.102     # 相机机
+ping 10.21.33.103     # 运控机
+```
+
+### ② 相机服务在跑（ROS 域必须是 2）
+```bash
+ssh ysc@10.21.33.102
+systemctl is-active realsense-camera.service     # 应输出 active
+systemctl show realsense-camera.service -p Environment
+#   应包含 ROS_DOMAIN_ID=2
+```
+
+> ⚠️ **相机在域 2，不是默认的域 0。** 起来的程序必须 `export ROS_DOMAIN_ID=2`，
+> 否则看不到相机话题、程序会报"没拿到图像"。
+> （服务已通过 systemd drop-in 设为域 2，见 TECHNICAL_REPORT §2.3）
+
+### ③ 机器人处于 **RL 控制(17)**
+```bash
+cd /home/ysc/tag_probe
+/home/ysc/follow_env/bin/python motion_cmd.py --status
+#   要看 MotionState=17。不是的话：
+/home/ysc/follow_env/bin/python motion_cmd.py --stand --go
+```
+
+> **轴指令只在 `MotionState=17` 下有效**，其他状态下会被**静默忽略**
+> （文档没说、也不报错）。程序里有状态门兜底，会自动输出零。
+
+### ④ tag 图打印好
+`tags/` 目录下已有 8 张，直接打印即可：
+
+| 文件 | id | 动作 |
+|---|---|---|
+| `tag41_12_00001.png` | 1 | 前进 |
+| `tag41_12_00018.png` | 18 | 后退 |
+| `tag41_12_00003.png` | 3 | 左转 |
+| `tag41_12_00061.png` | 61 | 右转 |
+| `tag41_12_00063.png` | 63 | 左侧移动 |
+| `tag41_12_00068.png` | 68 | 右侧移动 |
+| `tag41_12_00006.png` | 6 | 停止 |
+| `tag41_12_00000.png` | 0 | 切楼梯步态 |
+
+**打印注意**：
+- **白色静区（四周留白）必须一起打印** —— 裁掉就认不出
+- 别用光泽相纸（反光会让 tag 变白）
+- 贴平、别卷曲
+
+---
+
+## 2. 快速开始
+
+```bash
+# 在 .102 上
+ssh ysc@10.21.33.102
+cd /home/ysc/tag_probe
+source /opt/ros/jazzy/setup.bash
+export ROS_DOMAIN_ID=2
+
+# 干跑（只算不发，安全）—— 先确认能检测到 tag
+/home/ysc/follow_env/bin/python tag_command_fsm.py
+
+# 真跑（会真的指挥狗）
+/home/ysc/follow_env/bin/python tag_command_fsm.py --go --duration 120
+```
+
+**然后拿着 tag 在狗前面出示即可。**
+
+---
+
+## 3. tag 出示位置（**这一步错了就什么都测不出来**）
+
+相机装在狗前部、**朝前下方低头 35°** —— 它能看到的空间是一个固定的锥体：
+
+| 项 | 要求 |
 |---|---|
-| `tag_follower.py` | 追踪程序（自包含单文件，可直接拷到机器狗上跑） |
-| `../robot_dog_sdk/` | ASDU 协议层 + Web 遥控 + 模拟器（协议实现参考） |
-| `../robot_dog_sdk/docs/软件开发指南.pdf` | 厂商协议文档 |
+| **距离** | 狗正前方 **0.6 ~ 1.5 米** |
+| **高度** | **离地 20~30 cm（膝盖以下）** |
+| **横向** | 狗正前方 ±20° 内 |
+| **朝向** | tag 正面朝狗，别大角度倾斜 |
+| **关键** | **出示后保持不动** |
+
+> **举在胸前、或者离得太远，相机根本看不见** —— 程序会按"看不见就不动"停住，
+> 很容易被误判成程序坏了。
+
+> ⚠️ **必须举稳。** 实测：稳稳举着时单帧抓取 **30/30 全中**；
+> 手一晃，检测率掉到 **4~10%**，指令被打碎成"发 0.1 秒 / 停 0.3 秒"，
+> **四足机器人迈不起步来**。
+
+---
+
+## 4. 程序清单
+
+| 文件 | 干什么 | 常用命令 |
+|---|---|---|
+| **`tag_command_fsm.py`** | **主程序**：tag id → 动作 | `... --go --duration 120` |
+| `follow_controller.py` | 跟随模式：追着 tag 走，停在 1 米 | `... --go --max-wz 0` |
+| `motion_cmd.py` | 起立/趴下/切步态 | `... --stand --go` |
+| `axis_test.py` | 单轴/双轴指令测试 | `... --axis X --value 1.0 --hold 2 --go` |
+| `turn_90_test.py` | 闭环定角转向（积分 AngularZ） | `... --degrees -90 --go` |
+| `d435i_tag_monitor.py` | 实时监视 + tag 尺寸标定 | `... --calibrate 0.60 --duration 10` |
+| `d435i_tag_probe.py` | 抓帧 + 检测 + 存图（诊断用） | `... --frames 30 --save /tmp/x` |
+| `asdu_probe.py` | 只读状态/故障/电池/温度 | `... --seconds 6` |
+| `gen_tags.py` | 生成 tag 图 | `... 0 1 3 6 18 61 63 68` |
+
+**除 `asdu_probe.py` 和 `gen_tags.py` 外，其余都需要先 `source ROS` + `export ROS_DOMAIN_ID=2`。**
+
+---
+
+## 5. tag 指令状态机（最常用）
+
+### 动作表
+
+| tag id | 动作 | 发出的指令 |
+|---|---|---|
+| 1 | 前进 | `X = +1.0` |
+| 18 | 后退 | `X = −1.0` |
+| 3 | 左转 | `Yaw = +1.0` |
+| 61 | 右转 | `Yaw = −1.0` |
+| 63 | 左侧移动 | `Y = +1.0` |
+| 68 | 右侧移动 | `Y = −1.0` |
+| 6 | 停止 | 全零 |
+| 0 | 切楼梯步态 | `0x1003`（**先停稳再切**） |
+| 无 tag | 停止 | 全零 |
+
+**为什么全是 1.0（满量程）？** 实测这个通道**低值区不响应、而且非单调**：
+`X=0.06` 能走 0.127 m/s，但 `0.12` 只有 0.027、`0.5` 只有 0.017 —— **加大反而更慢**。
+详见 [TECHNICAL_REPORT §2.7](../TECHNICAL_REPORT.md)。
+
+### 常用参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--go` | 关 | **不加就是干跑**，只算不发 |
+| `--duration` | 0 | 跑多少秒，0 = 一直跑 |
+| `--lost-timeout` | 0.25 | 多久没检测到就视为丢失并归零（秒） |
+| `--min-px` | 20 | tag 最小像宽，挡掉远处小 tag 的误检 |
+| `--mag-x/--mag-y/--mag-yaw` | 1.0 | 各轴幅度 |
+| `--sign-x/--sign-y/--sign-yaw` | +1 | **方向反了就翻这个**（实测方向和文档不一定一致） |
+| `--stair-gait` | `0x1003` | tag 0 要切到的步态 |
+| `--hz` / `--det-hz` | 20 / 15 | 控制频率 / 检测频率 |
+
+**示例**：
+```bash
+# 干跑，看动作表和检测情况
+/home/ysc/follow_env/bin/python tag_command_fsm.py
+
+# 真跑 2 分钟
+/home/ysc/follow_env/bin/python tag_command_fsm.py --go --duration 120
+
+# 检测断续时放宽丢失宽限（代价：看不见后还会动最多 N 秒）
+/home/ysc/follow_env/bin/python tag_command_fsm.py --go --lost-timeout 1.0
+
+# 只测前进和停止两个 tag
+/home/ysc/follow_env/bin/python tag_command_fsm.py --go --duration 60
+```
+
+---
+
+## 6. 跟随模式
+
+```bash
+# 干跑（不发指令）
+/home/ysc/follow_env/bin/python follow_controller.py
+
+# 真跑：追到距 tag 1 米停，不转向
+/home/ysc/follow_env/bin/python follow_controller.py --go --max-wz 0
+
+# 带转向（转向是开关式，会猛转头）
+/home/ysc/follow_env/bin/python follow_controller.py --go --max-vx 0.6 --max-wz 1.0
+```
+
+**控制律**：`看不见 → 停` / `≤1m → 停` / `>1m → 追`。
+
+**架构**：两线程解耦 —— 检测线程 15Hz 更新"最新目标"，控制线程固定 20Hz 持续下发。
+（单线程"检测完才发一次"只能跑到 5Hz，狗会卡顿。）
+
+⚠️ **`--tag-size` 必须和实际打印尺寸一致**，否则跟随距离整体等比偏掉。
+用标定确认真实尺寸：
+```bash
+/home/ysc/follow_env/bin/python d435i_tag_monitor.py --calibrate 0.60 --duration 10
+#   把 tag 放在卷尺量准的 0.60m 处，它会反算真实黑框边长
+```
+
+---
+
+## 7. 诊断：出问题先跑这三个
+
+```bash
+# ① 相机出图了吗？（应 ≈15Hz）
+source /opt/ros/jazzy/setup.bash && export ROS_DOMAIN_ID=2
+ros2 topic hz /camera/camera/color/image_raw
+
+# ② 通路的机器人状态、电池、温度
+/home/ysc/follow_env/bin/python asdu_probe.py --seconds 6
+
+# ③ 相机到底拍到了什么？（存图回来看）
+/home/ysc/follow_env/bin/python d435i_tag_probe.py --frames 30 --save /tmp/x
+```
+
+| 现象 | 先查 |
+|---|---|
+| 程序说"没拿到图像" | `ROS_DOMAIN_ID=2` 设了吗？相机服务 active 吗？ |
+| 检测不到 tag | ③ 抓帧看画面 —— tag 进视野了吗？多大？清楚吗？ |
+| 检测断续 | **tag 举稳了吗**（最常见）；或手抖/反光/卷曲 |
+| 狗不动 | ② 看 `MotionState` 是不是 17；看电量；看有无故障 |
+| 动作方向反了 | 用 `--sign-x/--sign-y/--sign-yaw` 翻转 |
+| 步态切不动 | 轴指令和步态指令都要求 `MotionState=17` |
+
+---
+
+## 8. ⚠️ 安全须知
+
+1. **本程序的"停止"是软件零速，不是硬件急停。** 文档 §1.2.3 明确：软急停(-2)
+   仅支持查询、**不支持下发** —— **这份协议里没有任何急停指令**。
+   **真正的安全手段是机器人本体的物理急停按钮。**
+2. **⚠️ `Yaw = ±1.0` 是满量程转向（≈86°/s），狗会猛地转头。** 场地要留够。
+3. **不要和其他客户端同时控制。** 文档 §1.5 的 `0xE006` 要求轴指令 2 秒内同源
+   —— 手机 App / 手柄同时控制会互相踢掉，表现为"指令偶尔没反应"。
+4. **轴指令不返回任何响应帧**，失败是静默的。唯一的判据是机器人的实际状态反馈。
+5. **总有人在场看护。** 场地清空，手放断电位置。
+
+---
+
+## 9. 已知问题（截至 2026-09-20）
+
+| # | 问题 | 状态 |
+|---|---|---|
+| 1 | **前进响应弱**（0.027 m/s，追不上人） | 排查方向已收敛到**电量**：会话中 68%→35%→20%，响应正好在这期间垮掉。**充电到 60% 以上再测可定性** |
+| 2 | **转向起转时刻随机** | 同为满量程，起转延迟在 0.25s ~ 永不之间。所以转向用的是**开关式**（死区 8° 内不转，超过就满量程） |
+| 3 | **检测断续**（举不稳时 4~10%） | 举稳时 30/30 全中，**是操作问题不是算法问题**。必要时放宽 `--lost-timeout` |
+| 4 | 机器人是**轮足式**（腿末端有轮子） | 平地本应轮式滚动，但实测像"小碎步"。轮式是否需要单独启用，**待向厂商确认** |
+| 5 | `tag_size` 与实物可能不一致 | 20cm 的 tag 实测像宽反推约 10~12cm，**跟随时建议先标定** |
+
+---
+
+## 10. 本地 ↔ 远端同步（开发时用）
+
+源码在 `D:\lg\FOLLOW\robot_dog\follow\`，实际跑在 `.102:/home/ysc/tag_probe/`。
+
+```bash
+# 在 Git Bash 里，必须带这两个环境变量（否则路径被 MSYS 改写）
+export S10_PW="<密码>" MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*"
+S="D:/lg/FOLLOW/official_sdk/tools/s10.py"
+
+# 上传
+python "$S" 102 put "D:/lg/FOLLOW/robot_dog/follow/xxx.py" /home/ysc/tag_probe/xxx.py
+
+# 执行
+python "$S" 102 run "cd /home/ysc/tag_probe && source /opt/ros/jazzy/setup.bash && \
+  export ROS_DOMAIN_ID=2 && /home/ysc/follow_env/bin/python xxx.py --go"
+
+# 拉回文件（如图片）
+python "$S" 102 get /tmp/x/raw.jpg "D:/lg/FOLLOW/official_sdk/tag_probe/raw.jpg"
+```
+
+> ⚠️ **改完本地一定要上传再跑** —— 已经发生过"远端文件落后于本地"，
+> `follow_law.py` 差了个 2.5 倍的速度上限。
+
+---
+
+## 11. 相关
+
+| | |
+|---|---|
+| 协议来源 | 《软件开发指南》V1.0.1（`../robot_dog_sdk/docs/`） |
+| 协议层参考实现 | `../robot_dog_sdk/asdu_udp_control.py` |
+| 设计原理 / 实测标定 / 踩过的坑 | [`../TECHNICAL_REPORT.md`](../TECHNICAL_REPORT.md) |
+| 现场运行手册（导航项目） | `../s10_slam_nav/RUNBOOK.md` |
