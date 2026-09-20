@@ -24,15 +24,22 @@ from dt_apriltags import Detector
 
 
 def get_lib():
-    """拿到 (ctypes 库, family 指针)。
+    """拿到 (ctypes 库, family 指针, Detector)。
 
-    两个坑：
+    三个坑：
       · 这个 libapriltag.so 没导出 apriltag_family_create，但导出了
         apriltag_to_image —— family 指针从 Detector.tag_families 拿
         （值是 LP__ApriltagFamily，本身就是 ctypes 指针）。
       · apriltag_to_image 返回的 image_u8_t* 不要用 ctypes 结构体去解，
         字段对齐对不上会段错误（踩过）。改成调库里同样导出的
         image_u8_write_pnm() 落盘，再用 cv2 读回来 —— 绕开整个结构体。
+      · ★ 必须把 Detector 一起返回、由调用方【保持引用】★
+        family 指针指向 Detector 内部的 apriltag_family_t。Detector 一旦
+        被 GC 就会连带销毁它，之后再用这个指针就是 use-after-free，
+        表现为【运行时段错误、没有任何 Python 异常】。
+        这就是"gen_tags.py 单独跑段错误、内联版本却正常"的原因：内联时
+        Detector 还挂在模块作用域里没被回收，脚本里它在 get_lib() 返回时
+        就没了。实测确认：去掉引用后在 apriltag_to_image 那一行 SIGSEGV。
     """
     det = Detector(families="tagStandard41h12")
     lib = det.libc
@@ -41,7 +48,7 @@ def get_lib():
     lib.image_u8_write_pnm.restype = ctypes.c_int
     lib.image_u8_write_pnm.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     fam = det.tag_families["tagStandard41h12"]
-    return lib, fam
+    return lib, fam, det
 
 
 def raw_grid(lib, fam, idx, tmp="/tmp/_gen_tag.pnm"):
@@ -77,7 +84,9 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
-    lib, fam = get_lib()
+    # _det 必须留在本作用域里直到程序结束 —— 它一被回收，fam 就是悬垂指针，
+    # 下一步直接段错误。详见 get_lib() 的第 3 条。
+    lib, fam, _det = get_lib()
 
     # 自检用的检测器：生成完立刻回读，确认 id 对得上。
     # 不验的话，生成了认不出的图 = 白干，而且要等到上机才发现。
