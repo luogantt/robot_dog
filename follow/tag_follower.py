@@ -47,14 +47,24 @@ import time
 
 import cv2
 
-try:
-    from dt_apriltags import Detector
-except ImportError:
-    print("缺少 dt_apriltags。在机器狗上装：")
-    print("  python3 -m venv --system-site-packages /home/user/follow_env")
-    print("  /home/user/follow_env/bin/pip install -i "
-          "https://pypi.mirrors.ustc.edu.cn/simple dt-apriltags")
-    sys.exit(1)
+
+def _make_detector(**kw):
+    """构造 dt_apriltags 检测器。**延迟导入是有意的**：
+
+    本模块的 `RobotLink`（ASDU 客户端）被 tag_command_fsm / follow_controller
+    当成库在用，它们不该因为没装视觉库就起不来 —— 更不该在 import 阶段
+    `sys.exit(1)` 把整个进程带走（那会让"只想发个心跳"也做不到）。
+    只有真的要检测的 TagFollower / do_calib 才需要它。
+    """
+    try:
+        from dt_apriltags import Detector
+    except ImportError:
+        print("缺少 dt_apriltags。在机器狗上装：")
+        print("  python3 -m venv --system-site-packages /home/user/follow_env")
+        print("  /home/user/follow_env/bin/pip install -i "
+              "https://pypi.mirrors.ustc.edu.cn/simple dt-apriltags")
+        sys.exit(1)
+    return Detector(**kw)
 
 # ---------------------------------------------------------------- 配置
 
@@ -121,12 +131,33 @@ class RobotLink:
         self.target = (host, port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(0.2)
+        # ---- BasicStatus（2Hz）----
         self.motion_state = None
         self.gait = None
         self.mode = None
-        self.linear_x = 0.0
+        self.hes = None
+        self.charge = None
+        self.model = None
+        self.version = None
         self.last_status_t = 0.0
+        # ---- MotionStatus（10Hz）速度类 ----
+        self.linear_x = 0.0                       # 保留原名，老调用方在用
+        self.vel = {"LinearX": 0.0, "LinearY": 0.0, "LinearZ": 0.0,
+                    "AngularZ": 0.0, "Roll": 0.0, "Pitch": 0.0, "Yaw": 0.0}
+        # ---- 设备状态上报（2Hz）：16 电机 + 16 驱动器温度、电池 ----
+        self.device = {"motor": [], "driver": [], "battery": {}, "ts": 0.0}
+        # ---- 故障（§1.5 的 ErrorList 原始条目）----
+        self.faults = []
+        self.faults_t = 0.0
         self.axis_sent = 0
+
+    def worst_severity(self):
+        """当前活跃故障里最高的严重等级（0 = 无）。3=WARN 4=ERROR 5=FATAL。
+
+        每条故障的 Severities 是个数组，取其中最大的。
+        """
+        return max((max(f.get("Severities") or [0]) for f in self.faults),
+                   default=0)
 
     def heartbeat(self):
         self.sock.sendto(build_apdu(*CMD_HEARTBEAT, {}), self.target)
@@ -158,18 +189,50 @@ class RobotLink:
                 body = json.loads(data[16:16 + blen].decode())
             except Exception:
                 continue
+            # ⚠ 一律按 Items 键名判断，【不要按 Type】—— 文档 §1.3.1.3 写
+            #   0x00100002，实机是 0x00300002；按 Type 匹配会全部失配（实测过）。
             items = body.get("PatrolDevice", {}).get("Items", {}) or {}
+
             bs = items.get("BasicStatus")
             if isinstance(bs, dict):
                 self.motion_state = bs.get("MotionState")
                 self.gait = bs.get("Gait")
                 self.mode = bs.get("ControlUsageMode")
+                self.hes = bs.get("HES")
+                self.charge = bs.get("Charge")
+                self.model = bs.get("Model")
+                self.version = bs.get("Version")
                 self.last_status_t = time.monotonic()
                 n += 1
+
             ms = items.get("MotionStatus")
             if isinstance(ms, dict):
-                self.linear_x = ms.get("LinearX") or 0.0
+                for k in self.vel:
+                    v = ms.get(k)
+                    if isinstance(v, (int, float)):
+                        self.vel[k] = float(v)
+                self.linear_x = self.vel["LinearX"]      # 保留原名，老调用方在用
                 n += 1
+
+            # 设备状态上报（16 电机 + 16 驱动器温度、电池），2Hz。
+            # 同样按键名判断 —— 文档写 0x00100002，实机是 0x00300002。
+            if "DeviceTemperature" in items or "BatteryList" in items:
+                dt = items.get("DeviceTemperature") or {}
+                bats = items.get("BatteryList") or []
+                self.device = {
+                    "motor": list(dt.get("Motor") or []),
+                    "driver": list(dt.get("Driver") or []),
+                    "battery": (dict(bats[0])
+                                if bats and isinstance(bats[0], dict) else {}),
+                    "ts": time.monotonic(),
+                }
+
+            el = items.get("ErrorList")
+            if isinstance(el, list):
+                # 空的 ErrorList 也要照收 —— 它代表"故障已清空"。漏掉的话
+                # worst_severity() 会永远停在最后一次看到的故障上。
+                self.faults = el
+                self.faults_t = time.monotonic()
         return n
 
     def send_axis(self, x, yaw, y=0.0):
@@ -214,9 +277,9 @@ class TagFollower:
         self.deadband = deadband
         self.show = show
 
-        self.det = Detector(families=TAG_FAMILY, nthreads=2,
-                            quad_decimate=1.0, quad_sigma=0.8,
-                            refine_edges=1, decode_sharpening=0.5)
+        self.det = _make_detector(families=TAG_FAMILY, nthreads=2,
+                                  quad_decimate=1.0, quad_sigma=0.8,
+                                  refine_edges=1, decode_sharpening=0.5)
         self.cap = None
         self.link = RobotLink(ROBOT_HOST, ROBOT_PORT)
 

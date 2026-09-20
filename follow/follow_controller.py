@@ -51,10 +51,13 @@ from dt_apriltags import Detector
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from d435i_tag_probe import (DEFAULT_TAG_SIZE_M, FAMILY,  # noqa: E402
-                             Probe, imgmsg_to_bgr, tag_in_body,
-                             tag_normal_ground, tag_side_px)
+                             Probe, imgmsg_to_bgr, tag_in_body, tag_side_px)
 from follow_law import FollowConfig, FollowController  # noqa: E402
 from tag_follower import RobotLink  # noqa: E402  复用已写好的 ASDU 客户端
+import web_view  # noqa: E402
+
+# 观测界面的事件环 —— 控制律状态变化时往里塞一条，浏览器里能看到状态轨迹。
+EVENTS = web_view.Events()
 def install_sigterm_as_interrupt():
     """让 SIGTERM 也走 KeyboardInterrupt 分支，触发 finally 里的归零。
 
@@ -129,11 +132,16 @@ class SharedTarget:
             if hit:
                 self.hits += 1
 
+    def stats(self):
+        """(检测帧数, 命中帧数) —— 观测界面用，与 SharedTag.stats() 对齐。"""
+        with self.lock:
+            return self.frames, self.hits
+
 
 class DetectorThread(threading.Thread):
     """线程1：相机 → 检测 → 更新共享目标。只碰相机，不碰 socket。"""
 
-    def __init__(self, node, det, shared, tag_size, want_id, hz):
+    def __init__(self, node, det, shared, tag_size, want_id, hz, cam=None):
         super().__init__(daemon=True, name="detector")
         self.node = node
         self.det = det
@@ -142,18 +150,29 @@ class DetectorThread(threading.Thread):
         self.want_id = want_id
         self.period = 1.0 / hz
         self.running = True
+        self.cam = cam                 # 观测界面的相机健康计数，可为 None
         k = node.info.k
         self.fx, self.fy, self.cx0, self.cy0 = k[0], k[4], k[2], k[5]
 
     def run(self):
         next_t = time.monotonic()
         while self.running:
-            if not self.node.frames:
-                rclpy.spin_once(self.node, timeout_sec=0.05)
-                continue
-            msg = self.node.frames[-1]       # 只取最新，丢弃积压
-            self.node.frames.clear()
-            rclpy.spin_once(self.node, timeout_sec=0.0)
+            try:
+                if not self.node.frames:
+                    rclpy.spin_once(self.node, timeout_sec=0.05)
+                    continue
+                msg = self.node.frames[-1]   # 只取最新，丢弃积压
+                self.node.frames.clear()
+                rclpy.spin_once(self.node, timeout_sec=0.0)
+            except Exception:
+                # 关停时主线程可能已经 rclpy.shutdown() 了，检测线程里的
+                # spin_once 就会抛 RCLError / ExternalShutdownException。
+                # 那是正常收尾、不是崩溃 —— 静默退出即可。
+                if not rclpy.ok():
+                    break
+                raise
+            if self.cam is not None:
+                self.cam.tick(msg)
 
             t0 = time.monotonic()
             bgr = imgmsg_to_bgr(msg)
@@ -201,19 +220,29 @@ def main():
 
     ap.add_argument("--hz", type=float, default=20.0, help="控制循环频率")
     ap.add_argument("--det-hz", type=float, default=15.0, help="检测线程最高频率")
-    ap.add_argument("--lost-timeout", type=float, default=0.25,
-                    help="多久没有新检测就视为丢失并归零（秒）。0=任何一帧没检测到就停")
+    ap.add_argument("--lost-timeout", type=float, default=1.0,
+                    help="漏检宽限（秒）：这么久没再看到 tag 才归零；宽限内沿用上次"
+                         "命中的位置继续闭环。默认 1.0 是照【实测约 1s 的起步时间】"
+                         "定的 —— 宽限小于它的话，任何一次漏检都要重新爬坡，指令会"
+                         "被打成碎片。代价：真丢了 tag 之后仍会按最后位置多动这么久")
     ap.add_argument("--duration", type=float, default=0.0, help="0=一直跑")
+    ap.add_argument("--web-port", type=int, default=8010,
+                    help="只读观测界面的端口 → http://<本机>:端口/ 。0 = 不开界面")
     args = ap.parse_args()
 
     if args.max_wz == 0:
         print("[说明] --max-wz 0：转向完全关闭，只直着走")
 
     cfg = FollowConfig(tag_id=args.tag_id, target_dist_m=args.target,
-                       max_vx=args.max_vx, max_wz=args.max_wz,
-                       lost_timeout_s=0.0)   # 过期判断在下面做，见 --lost-timeout
+                       max_vx=args.max_vx, max_wz=args.max_wz)
     ctrl = FollowController(cfg)
     shared = SharedTarget()
+    cam = web_view.CamStats()
+    # 观测界面要的快照：HTTP 线程读、主循环写。锁只保护一次整体赋值。
+    view_lock = threading.Lock()
+    view_state = {"why": "启动中", "vx": 0.0, "wz": 0.0, "tgt": "", "gate": "",
+                  "pos": None, "dist": None, "ticks": 0, "sent": 0, "det_ms": 0.0}
+    view = None
 
     rclpy.init()
     node = Probe()
@@ -255,39 +284,121 @@ def main():
         print()
 
         det_thread = DetectorThread(node, det, shared, args.tag_size,
-                                    cfg.tag_id, args.det_hz)
+                                    cfg.tag_id, args.det_hz, cam=cam)
         det_thread.start()
 
         period = 1.0 / args.hz
         t_start = time.monotonic()
         next_t = t_start
-        last_beat = last_print = last_status_ts = 0.0
+        last_beat = last_print = 0.0
+        cur_why = None                 # 控制律状态变化时记一条给观测界面
+
+        # ---- 只读观测界面（不影响控制：只读快照，从不发送任何 ASDU 报文）----
+        if args.web_port:
+            def snapshot():
+                with view_lock:
+                    vs = dict(view_state)          # O(1) 拷贝，锁只到这里
+                frames, hits = shared.stats()
+                frames_cam, fps, age, w, h, enc = cam.snap()
+                pos = vs.get("pos")
+                snap = {
+                    "now": time.time(),
+                    "app": {
+                        "name": "follow_controller",
+                        "go": args.go,
+                        "uptime_s": time.monotonic() - t_start,
+                        "control_hz": vs["ticks"] / max(1e-9, time.monotonic() - t_start),
+                        "det_hz": frames / max(1e-9, time.monotonic() - t_start),
+                        "det_ms": vs.get("det_ms"),
+                        "events": EVENTS.tail(25),
+                    },
+                    "det": {"rows": [
+                        {"k": "控制律", "v": vs.get("why") or "—"},
+                        {"k": "tag 位置（前/左）",
+                         "v": "—" if not pos else f'{pos[0]:+.2f} / {pos[1]:+.2f} m'},
+                        {"k": "距 tag", "v": "—" if vs.get("dist") is None
+                            else f'{vs["dist"]:.2f} m（目标 {args.target:.2f}）'},
+                        # 配色：本帧=绿；宽限内=黄；丢失=红；从未检测到=不标色
+                        {"k": "检测时效", "v": vs.get("tgt") or "—",
+                         "lvl": ("ok" if vs.get("tgt") == "本帧"
+                                 else ("warn" if "宽限" in (vs.get("tgt") or "")
+                                       else ("err" if "丢失" in (vs.get("tgt") or "")
+                                             else "")))},
+                        {"k": "正在发出 vx / wz",
+                         "v": f'{vs.get("vx", 0.0):+.3f} / {vs.get("wz", 0.0):+.3f} '
+                              f'(上限 {args.max_vx:.2f} / {args.max_wz:.2f})'},
+                        {"k": "状态门", "v": vs.get("gate") or "未拦截",
+                         "lvl": "err" if vs.get("gate") else "ok"},
+                        {"k": "解算耗时", "v": ("—" if vs.get("det_ms") is None
+                                              else f'{vs["det_ms"]:.0f} ms')},
+                        {"k": "漏检宽限 / 状态中断",
+                         "v": f'{args.lost_timeout * 1000:.0f} / '
+                              f'{STATUS_STALE_S * 1000:.0f} ms'},
+                        {"k": "累计 tick / 轴指令",
+                         "v": f'{vs.get("ticks", 0)} / {vs.get("sent", 0)}'},
+                    ]},
+                }
+                snap.update(web_view.robot_snapshot(link))
+                snap["camera"] = web_view.camera_snapshot(
+                    frames_cam, hits, fps, age, w, h, enc)
+                return snap
+
+            view = web_view.WebView(snapshot, port=args.web_port)
+            view.start()
 
         while True:
             now = time.monotonic()
             if args.duration > 0 and now - t_start > args.duration:
                 break
 
-            # ---- 读最新目标，判过期 ----
-            pos, nrm, ts, seq, det_ms = shared.get()
-            stale = (now - ts) > args.lost_timeout if ts > 0 else True
-            if stale:
-                pos = nrm = None
-
-            vx, wz, why = ctrl.update(pos, nrm, now)
-
-            # ---- 状态门：不在 RL 控制就归零 ----
-            if link.motion_state is not None and link.motion_state != MOTION_RL:
-                vx = wz = 0.0
-                why = f"非 RL 控制({link.motion_state}) → 停"
-
-            # ---- 心跳 / 收状态 ----
+            # ---- 心跳 / 收状态（放在判断之前，本轮用最新状态）----
             if now - last_beat > 1.0:
                 link.heartbeat()
                 last_beat = now
-            n = link.pump(0.004)   # 只给它 4ms，别占满 50ms 周期
-            if n:
-                last_status_ts = now
+            link.pump(0.004)   # 只给它 4ms，别占满 50ms 周期
+
+            # ---- 读最新目标 ----
+            pos, good_pos, frame_ts, good_ts, seq, det_ms = shared.get()
+            # 过期判断用【最后一次真的看到 tag】的时间，不是最后一帧的时间。
+            # 漏检但在宽限期内 → 沿用上次命中的位置，控制律继续闭环
+            # （比冻结上一条指令好：狗在这期间移动了，但几何方向依然大致成立）
+            if good_ts <= 0:
+                pos, tgt = None, "从未检测到"
+            else:
+                age = now - good_ts
+                if age > args.lost_timeout:
+                    pos, tgt = None, f"丢失 {age:.2f}s"
+                elif pos is None:
+                    pos, tgt = good_pos, f"漏检 {age:.2f}s(宽限内)"
+                else:
+                    tgt = "本帧"
+
+            vx, wz, why = ctrl.update(pos, now)
+
+            # ---- 状态门：上报中断 / FATAL 故障 / 不在 RL 控制 → 归零 ----
+            # ⚠ 必须放在 pump() 之后，用最新状态判断。只看 motion_state 的值
+            #    不够：通信断了它会永远停在最后一个值（比如 17），程序会以为
+            #    机器人还在线，继续下发运动指令 —— 实测踩过。
+            st_age = now - link.last_status_t if link.last_status_t > 0 else None
+            gate = ""                      # 门因，空=没拦（观测界面显示用）
+            if st_age is None:
+                vx = wz = 0.0
+                why = "尚未收到状态上报 → 停"
+                gate = "尚未收到状态上报"
+            elif st_age > STATUS_STALE_S:
+                vx = wz = 0.0
+                why = f"状态上报中断 {st_age:.1f}s → 停"
+                gate = f"状态上报中断 {st_age:.1f}s"
+            elif link.worst_severity() >= 5:
+                # 【本次新增】与 tag_command_fsm 同一条门：severity 5 = FATAL。
+                # 之前 RobotLink 没解析 ErrorList，这条门两个程序都没生效过。
+                vx = wz = 0.0
+                why = "FATAL 故障 → 停"
+                gate = "FATAL 故障（severity ≥ 5）"
+            elif link.motion_state != MOTION_RL:
+                vx = wz = 0.0
+                why = f"非 RL 控制({link.motion_state}) → 停"
+                gate = f"非 RL 控制（当前 {link.motion_state}）"
 
             # ---- 每个 tick 都发（关键：持续流式下发）----
             if args.go:
@@ -295,12 +406,22 @@ def main():
                 sent += 1
             ticks += 1
 
+            # ---- 更新观测界面快照（HTTP 线程读；锁只保护这一次整体赋值）----
+            dist = ((pos[0] ** 2 + pos[1] ** 2) ** 0.5) if pos else None
+            with view_lock:
+                view_state.update(why=why, vx=vx, wz=wz, tgt=tgt, gate=gate,
+                                  pos=(tuple(pos) if pos else None), dist=dist,
+                                  ticks=ticks, sent=sent, det_ms=det_ms)
+            if why != cur_why:                 # 状态变化才记一条，别刷屏
+                EVENTS.add("info", why)
+                cur_why = why
+
             if now - last_print > 0.5 and now - t_start > 1.0:
                 pos_txt = (f"前={pos[0]:+.2f} 左={pos[1]:+.2f}"
                            if pos is not None else "未见")
                 print(f"  控制{ticks/ max(1e-9, now-t_start):4.1f}Hz "
                       f"检测{shared.seq/ max(1e-9, now-t_start):4.1f}Hz "
-                      f"解算{det_ms:.0f}ms | {pos_txt} | "
+                      f"解算{det_ms:.0f}ms | {pos_txt} [{tgt}] | "
                       f"vx={vx:+.3f} wz={wz:+.3f} | {why}")
                 last_print = now
 
@@ -316,6 +437,8 @@ def main():
     except KeyboardInterrupt:
         print("\n[中断]")
     finally:
+        if view is not None:
+            view.stop()
         if det_thread:
             det_thread.running = False
         print("归零 ...")

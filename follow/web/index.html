@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>follow 观测</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header>
+  <div><h1>follow 观测</h1><span class="tag" id="appTag">—</span><span class="tag" id="modeTag">—</span></div>
+  <div class="conn"><span class="dot" id="connDot"></span><span id="connText">连接中…</span></div>
+</header>
+
+<!-- 只读说明：这个界面绝不发送任何指令 -->
+<section class="panel status" style="padding:10px 14px">
+  <div class="stat" style="grid-column:1/-1">
+    <label>本界面为只读观测</label>
+    <b style="font-size:13px;color:var(--dim);font-weight:400">
+      不发任何 ASDU 报文；控制请看 <code>deploy_start.sh</code> / <code>motion_cmd.py</code>
+    </b>
+  </div>
+</section>
+
+<!-- 顶部关键指标 -->
+<section class="panel status">
+  <div class="stat"><label>控制频率</label><b id="sCtlHz">—</b><i>Hz</i></div>
+  <div class="stat"><label>检测频率</label><b id="sDetHz">—</b><i>Hz</i></div>
+  <div class="stat"><label>解算耗时</label><b id="sDetMs">—</b><i>ms</i></div>
+  <div class="stat"><label>运行状态</label><b id="sMotion">—</b></div>
+  <div class="stat"><label>步态</label><b id="sGait">—</b></div>
+  <div class="stat"><label>使用模式</label><b id="sMode">—</b></div>
+  <div class="stat"><label>相机帧率</label><b id="sCamFps">—</b><i>Hz</i></div>
+  <div class="stat"><label>检测命中率</label><b id="sHit">—</b></div>
+  <div class="stat"><label>温度 max</label><b id="sTempMax">—</b><i>°C</i></div>
+  <div class="stat"><label>电量</label><b id="sBat">—</b><i>%</i></div>
+</section>
+
+<div id="faults" class="faults hidden"></div>
+
+<main>
+  <div>
+    <!-- 控制程序自己的判断 —— 这是集成模式独有的价值 -->
+    <section class="panel">
+      <h2>控制程序 <small class="tempHint" id="appHint"></small></h2>
+      <div id="detRows"></div>
+    </section>
+
+    <section class="panel">
+      <h2>相机 <small class="tempHint" id="camHint"></small></h2>
+      <div id="camRows"></div>
+    </section>
+  </div>
+
+  <div>
+    <section class="panel">
+      <h2>关节温度 <small class="tempHint" id="tempHint"></small></h2>
+      <div class="tempGrid" id="tempGrid"></div>
+      <div style="margin-top:8px;font-size:11px;color:var(--dim)">
+        <span class="tLegend">左列=电机</span>
+        <span class="tLegend tLegend warn">≥60 偏高</span>
+        <span class="tLegend tLegend hot">≥75 过热</span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>机器人</h2>
+      <div id="robotRows"></div>
+    </section>
+
+    <section class="panel">
+      <h2>速度反馈</h2>
+      <div id="velRows"></div>
+    </section>
+
+    <section class="panel">
+      <h2>电池</h2>
+      <div id="batRows"></div>
+    </section>
+  </div>
+</main>
+
+<section class="panel">
+  <h2>事件日志 <small class="tempHint">最近 300 条</small></h2>
+  <div class="log" id="log"></div>
+</section>
+
+<script src="/app.js"></script>
+</body>
+</html>

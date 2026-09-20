@@ -63,6 +63,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from d435i_tag_probe import (DEFAULT_TAG_SIZE_M, FAMILY,  # noqa: E402
                              Probe, imgmsg_to_bgr, tag_side_px)
 from tag_follower import RobotLink  # noqa: E402
+import web_view  # noqa: E402
+
+# 观测界面的事件环 —— 终端打印的同时也进这里，浏览器里能看到同一份记录。
+EVENTS = web_view.Events()
 def install_sigterm_as_interrupt():
     """让 SIGTERM 也走 KeyboardInterrupt 分支，触发 finally 里的归零。
 
@@ -138,28 +142,48 @@ HARD_LIMIT = {"x": 1.00, "y": 1.00, "yaw": 1.00}
 
 
 class SharedTag:
-    """线程A 写、线程B 读的"当前 tag"。带时间戳供过期判断。"""
+    """线程A 写、线程B 读的"当前 tag"。
+
+    ★ 两个时间戳必须分开存（这里踩过，代价很大）★
+        frame_ts —— 检测线程最后一次【处理完一帧】的时间。只反映线程活没活。
+        good_ts  —— 最后一次【真的命中动作表里的 tag】的时间。过期判断用这个。
+
+    原先只有一个 ts，而漏检帧也会刷新它，于是 --lost-timeout 实际只检测
+    "检测线程卡死"，想要的"漏检宽限"从来没生效过 —— 漏一帧就立刻归零。
+
+    实测代价（2026-09-20 的 run.log）：命中率 8% 时指令被切成 0.1~0.3 秒的
+    碎片，中间夹着"停止(无tag)"；而机器人需要约 1 秒连续指令才能起速
+    （实测 0.25s→0.17、0.50s→0.39、1.10s→0.86 m/s）。所以每个脉冲最多把
+    速度推到 0.17 m/s 就归零 —— 狗只会抽动、根本迈不起步子。
+    """
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.tag_id = None
+        self.tag_id = None       # 本帧命中的 id；漏检帧为 None
         self.px = 0.0
-        self.ts = 0.0
+        self.good_id = None      # 最后一次命中，供漏检宽限期沿用
+        self.good_px = 0.0
+        self.frame_ts = 0.0
+        self.good_ts = 0.0       # 0 = 从未命中
         self.frames = 0
         self.hits = 0
-        self.seen_counts = {}      # 本次运行各 id 命中次数
+        self.det_ms = 0.0        # 最近一帧的解算耗时（观测界面用）
+        self.seen_counts = {}    # 本次运行各 id 命中次数
 
-    def put(self, tag_id, px, now):
+    def put(self, tag_id, px, now, det_ms=0.0):
         with self.lock:
-            self.tag_id, self.px, self.ts = tag_id, px, now
+            self.tag_id, self.px, self.frame_ts = tag_id, px, now
             self.frames += 1
+            self.det_ms = det_ms
             if tag_id is not None:
+                self.good_id, self.good_px, self.good_ts = tag_id, px, now
                 self.hits += 1
                 self.seen_counts[tag_id] = self.seen_counts.get(tag_id, 0) + 1
 
     def get(self):
         with self.lock:
-            return self.tag_id, self.px, self.ts
+            return (self.tag_id, self.px, self.frame_ts, self.good_ts,
+                    self.good_id, self.good_px, self.det_ms)
 
     def stats(self):
         with self.lock:
@@ -167,8 +191,13 @@ class SharedTag:
 
 
 def log_state(msg):
-    """状态机自己的日志（和每秒的状态行区分开，带时间戳）。"""
+    """状态机自己的日志（和每秒的状态行区分开，带时间戳）。
+
+    同时喂给观测界面的事件环，浏览器里能看到和终端一样的状态切换记录。
+    """
     print(f"  [{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    EVENTS.add("ok" if msg.startswith("✅")
+               else ("warn" if msg.startswith("⚠") else "info"), msg)
 
 
 def detect_cmd_tag(det, gray, fx, fy, cx0, cy0, tag_size, min_px):
@@ -197,31 +226,45 @@ def detect_cmd_tag(det, gray, fx, fy, cx0, cy0, tag_size, min_px):
 class DetectorThread(threading.Thread):
     """线程A：相机 → 检测 → 更新共享 tag。只碰相机，不碰 socket。"""
 
-    def __init__(self, node, det, shared, tag_size, min_px, hz):
+    def __init__(self, node, det, shared, tag_size, min_px, hz, cam=None):
         super().__init__(daemon=True, name="detector")
         self.node, self.det, self.shared = node, det, shared
         self.tag_size, self.min_px = tag_size, min_px
         self.period = 1.0 / hz
         self.running = True
+        self.cam = cam                 # 观测界面的相机健康计数，可为 None
         k = node.info.k
         self.fx, self.fy, self.cx0, self.cy0 = k[0], k[4], k[2], k[5]
 
     def run(self):
         next_t = time.monotonic()
         while self.running:
-            if not self.node.frames:
-                rclpy.spin_once(self.node, timeout_sec=0.05)
-                continue
-            msg = self.node.frames[-1]        # 只取最新，丢弃积压
-            self.node.frames.clear()
-            rclpy.spin_once(self.node, timeout_sec=0.0)
+            try:
+                if not self.node.frames:
+                    rclpy.spin_once(self.node, timeout_sec=0.05)
+                    continue
+                msg = self.node.frames[-1]    # 只取最新，丢弃积压
+                self.node.frames.clear()
+                rclpy.spin_once(self.node, timeout_sec=0.0)
+            except Exception:
+                # 关停时主线程可能已经 rclpy.shutdown() 了，检测线程里的
+                # spin_once 就会抛 RCLError / ExternalShutdownException。
+                # 那是正常收尾、不是崩溃 —— 静默退出即可。否则日志末尾
+                # 会挂一大段 traceback，看起来像程序炸了（实际归零早发完了）。
+                if not rclpy.ok():
+                    break
+                raise
+            if self.cam is not None:
+                self.cam.tick(msg)
 
             bgr = imgmsg_to_bgr(msg)
             gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            t0 = time.monotonic()
             tid, px = detect_cmd_tag(self.det, gray, self.fx, self.fy,
                                      self.cx0, self.cy0, self.tag_size,
                                      self.min_px)
-            self.shared.put(tid, px, time.monotonic())
+            det_ms = (time.monotonic() - t0) * 1000.0
+            self.shared.put(tid, px, time.monotonic(), det_ms)
 
             next_t += self.period
             # 只读一次时钟再判断 —— 先比后算会让差值为负，sleep 抛
@@ -268,6 +311,8 @@ def main():
     ap.add_argument("--sign-x", type=float, default=1.0, choices=(1.0, -1.0))
     ap.add_argument("--sign-y", type=float, default=1.0, choices=(1.0, -1.0))
     ap.add_argument("--sign-yaw", type=float, default=1.0, choices=(1.0, -1.0))
+    ap.add_argument("--web-port", type=int, default=8010,
+                    help="只读观测界面的端口 → http://<本机>:端口/ 。0 = 不开界面")
     args = ap.parse_args()
 
     mag = {"x": args.mag_x, "y": args.mag_y, "yaw": args.mag_yaw}
@@ -282,6 +327,13 @@ def main():
         sys.exit("[拒绝启动] 幅度超过该轴硬上限。改小参数，别让它静默钳制。")
 
     shared = SharedTag()
+    cam = web_view.CamStats()
+    # 观测界面要的快照：HTTP 线程读、主循环写。锁只保护一次整体赋值。
+    view_lock = threading.Lock()
+    view_state = {"name": "启动中", "out": {}, "tgt": "", "gate": "",
+                  "ticks": 0, "sent": 0}
+    view = None
+
     rclpy.init()
     node = Probe()
     det = Detector(families=FAMILY, nthreads=2, quad_decimate=1.0,
@@ -344,7 +396,7 @@ def main():
         print()
 
         det_thread = DetectorThread(node, det, shared, args.tag_size,
-                                    args.min_px, args.det_hz)
+                                    args.min_px, args.det_hz, cam=cam)
         det_thread.start()
 
         period = 1.0 / args.hz
@@ -354,18 +406,90 @@ def main():
         cur_name = None
         # 步态切换子状态机（见循环里的 GAIT 分支）
         gait_phase = "idle"          # idle | settling | switching | done
+        gait_target = None           # 本次切换的目标步态值；换目标就重跑流程
         gait_t0 = 0.0
         gait_sent_t = 0.0
+
+        # ---- 只读观测界面（不影响控制：只读快照，从不发送任何 ASDU 报文）----
+        if args.web_port:
+            def snapshot():
+                with view_lock:
+                    vs = dict(view_state)          # O(1) 拷贝，锁只到这里
+                frames, hits, counts = shared.stats()
+                frames_cam, fps, age, w, h, enc = cam.snap()
+                snap = {
+                    "now": time.time(),
+                    "app": {
+                        "name": "tag_command_fsm",
+                        "go": args.go,
+                        "uptime_s": time.monotonic() - t_start,
+                        "control_hz": vs["ticks"] / max(1e-9, time.monotonic() - t_start),
+                        "det_hz": frames / max(1e-9, time.monotonic() - t_start),
+                        "det_ms": vs.get("det_ms"),
+                        "events": EVENTS.tail(25),
+                    },
+                    "det": {"rows": [
+                        {"k": "当前动作", "v": vs["name"]},
+                        {"k": "tag id", "v": "—" if vs.get("tid") is None
+                            else f'{vs["tid"]}  ({vs.get("px", 0):.0f}px)'},
+                        # 配色：本帧=绿；宽限内=黄；丢失=红；从未检测到=不标色
+                        # （还没举 tag 时"从未检测到"是正常状态，标红是误报）
+                        {"k": "检测时效", "v": vs.get("tgt") or "—",
+                         "lvl": ("ok" if vs.get("tgt") == "本帧"
+                                 else ("warn" if "宽限" in (vs.get("tgt") or "")
+                                       else ("err" if "丢失" in (vs.get("tgt") or "")
+                                             else "")))},
+                        {"k": "正在发出 X/Y/Yaw",
+                         "v": "—" if not vs.get("out") else
+                              "{:+.3f} / {:+.3f} / {:+.3f}".format(
+                                  vs["out"].get("x", 0.0), vs["out"].get("y", 0.0),
+                                  vs["out"].get("yaw", 0.0))},
+                        {"k": "状态门", "v": vs.get("gate") or "未拦截",
+                         "lvl": "err" if vs.get("gate") else "ok"},
+                        {"k": "解算耗时", "v": ("—" if vs.get("det_ms") is None
+                                              else f'{vs["det_ms"]:.0f} ms')},
+                        {"k": "漏检宽限 / 状态中断",
+                         "v": f'{args.lost_timeout * 1000:.0f} / '
+                              f'{STATUS_STALE_S * 1000:.0f} ms'},
+                        {"k": "累计 tick / 轴指令",
+                         "v": f'{vs.get("ticks", 0)} / {vs.get("sent", 0)}'},
+                    ]},
+                }
+                snap.update(web_view.robot_snapshot(link))
+                snap["camera"] = web_view.camera_snapshot(
+                    frames_cam, hits, fps, age, w, h, enc)
+                return snap
+
+            view = web_view.WebView(snapshot, port=args.web_port)
+            view.start()
 
         while True:
             now = time.monotonic()
             if args.duration > 0 and now - t_start > args.duration:
                 break
 
-            tid, px, ts = shared.get()
-            stale = (now - ts) > args.lost_timeout if ts > 0 else True
-            if stale:
-                tid = None
+            # ---- 心跳 / 收状态（放在本轮判断之前，本轮用最新状态）----
+            if now - last_beat > 1.0:
+                link.heartbeat()
+                last_beat = now
+            link.pump(0.004)   # 只给它 4ms，别占满 50ms 周期
+
+            # ---- 读最新 tag ----
+            tid, px, frame_ts, good_ts, good_id, good_px, det_ms = shared.get()
+            # 过期判断用【最后一次真的命中】的时间，不是最后一帧的时间。
+            # 漏检但在宽限期内 → 沿用上次的 tag，指令保持连续（关键：机器人
+            # 要约 1 秒连续指令才能起速，指令一碎就走不起来）
+            if good_ts <= 0:
+                tid, px, tgt = None, 0.0, "从未检测到"
+            else:
+                age = now - good_ts
+                if age > args.lost_timeout:
+                    tid, px, tgt = None, 0.0, f"丢失 {age:.2f}s"
+                elif tid is None:
+                    tid, px = good_id, good_px        # 宽限期内沿用
+                    tgt = f"漏检 {age:.2f}s(宽限内)"
+                else:
+                    tgt = "本帧"
 
             # ---- 状态机：tag id → 动作 ----
             if tid is None:
@@ -414,37 +538,57 @@ def main():
                         gait_phase = "done"
                         mode = link.mode
                         log_state(f"✅ 步态已切到 {hex(tg)}"
-                                  f"（使用模式 {mode}）")
+                                  f"（{GAIT_NAMES.get(tg, '?')}）"
+                                  f"使用模式 {mode}")
                         if mode == 1:
                             log_state("⚠️ 使用模式变成 1（导航）—— "
                                       "§1.2.5 比例轴指令已失效，其他 tag 全废！"
-                                      "请切回 0x1001")
+                                      "请用 tag 69 切回 0x1001")
                     elif now - gait_t0 > args.gait_timeout:
                         gait_phase = "idle"
                         log_state(f"⚠️ {args.gait_timeout:.0f}s 内未切到 "
                                   f"{hex(tg)}（当前 {hex(link.gait or 0)}）"
                                   f"—— 下轮重试")
                 if gait_phase == "done":
-                    name = f"楼梯步态·已生效({hex(tg)})"
+                    name = f"{label}·已生效({hex(tg)})"
 
-            # ---- 状态门 ----
-            if link.motion_state is not None and link.motion_state != MOTION_RL:
+            # ---- 状态门：上报中断 / FATAL 故障 / 不在 RL 控制 → 停止 ----
+            # ⚠ 必须放在 pump() 之后，用最新状态判断。只看 motion_state 的值
+            #    不够：通信断了它会永远停在最后一个值（比如 17），程序会以为
+            #    机器人还在线，继续 20Hz 下发运动指令。
+            st_age = now - link.last_status_t if link.last_status_t > 0 else None
+            gate = ""                      # 门因，空=没拦（观测界面显示用）
+            if st_age is None:
+                out = {"x": 0.0, "y": 0.0, "yaw": 0.0}
+                name = "停止(尚未收到状态上报)"
+                gate = "尚未收到状态上报"
+            elif st_age > STATUS_STALE_S:
+                out = {"x": 0.0, "y": 0.0, "yaw": 0.0}
+                name = f"停止(状态上报中断 {st_age:.1f}s)"
+                gate = f"状态上报中断 {st_age:.1f}s"
+            elif link.worst_severity() >= 5:
+                # 【本次新增】本文件开头一直声称"有 FATAL 故障 → 停止"，但
+                # RobotLink 原先根本没解析 ErrorList，这条门从来没生效过。
+                # 现在解析补上了，门也补上。severity 5 = FATAL。
+                out = {"x": 0.0, "y": 0.0, "yaw": 0.0}
+                name = "停止(FATAL 故障)"
+                gate = "FATAL 故障（severity ≥ 5）"
+            elif link.motion_state != MOTION_RL:
                 out = {"x": 0.0, "y": 0.0, "yaw": 0.0}
                 name = f"停止(非RL控制 {link.motion_state})"
-
-            # ---- 心跳 / 收状态 ----
-            if now - last_beat > 1.0:
-                link.heartbeat()
-                last_beat = now
-            n = link.pump(0.004)
-            if n:
-                pass
+                gate = f"非 RL 控制（当前 {link.motion_state}）"
 
             # ---- 每个 tick 都发（持续流式下发）----
             if args.go:
                 link.send_axis(out["x"], out["yaw"], out["y"])
                 sent += 1
             ticks += 1
+
+            # ---- 更新观测界面快照（HTTP 线程读；锁只保护这一次整体赋值）----
+            with view_lock:
+                view_state.update(name=name, out=dict(out), tgt=tgt, gate=gate,
+                                  ticks=ticks, sent=sent, tid=tid, px=px,
+                                  det_ms=det_ms)
 
             # ---- 状态切换时打一条 ----
             if name != cur_name:
@@ -470,6 +614,8 @@ def main():
     except KeyboardInterrupt:
         print("\n[中断]")
     finally:
+        if view is not None:
+            view.stop()
         if det_thread:
             det_thread.running = False
         print("归零 ...")

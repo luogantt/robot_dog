@@ -8,6 +8,12 @@
 #
 # 停止用 ./deploy_stop.sh
 #
+# ★ 本脚本【只检查、不动作】★
+#   起立/趴下这类有物理后果的动作要你自己先做 —— 脚本不替你做决定。
+#   理由：脚本不看着场地，也不知道你是不是刚因为它过热而主动停下的。
+#   狗不在 RL 控制(17) 时轴指令会被静默忽略，所以检查不过就拒绝启动，
+#   并把该跑的命令打出来。顺序永远是：【先让狗起立】→ 再跑本脚本。
+#
 # ⚠️ 同一时刻只能有一个「轴指令发送源」（文档 §1.5 的 0xE006）。
 #    本脚本启动前会检查 .103 上的 Web 遥控是否开着 —— 开着的话会拒绝启动，
 #    因为两边会互相踢。要一起用就先 ./stop_web.sh（在 .103 上）。
@@ -31,10 +37,12 @@ MODE=fsm                          # fsm | follow | dry
 TARGET_DUR=0                      # 0 = 一直跑
 while [ $# -gt 0 ]; do
     case "$1" in
-        --follow) MODE=follow ;;
-        --dry)    MODE=dry ;;
-        --dur)    shift; TARGET_DUR="$1" ;;
-        -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --follow)   MODE=follow ;;
+        --dry)      MODE=dry ;;
+        --dur)      shift; TARGET_DUR="$1" ;;
+        # 打印文件开头的注释块（跳过第 1、2 行，到下一个 # ==== 为止）
+        -h|--help)  awk 'NR>2 && /^# ====/{exit} NR>2{sub(/^# ?/,""); print}' "$0"
+                    exit 0 ;;
         *) echo "未知参数：$1（用 --help）"; exit 1 ;;
     esac
     shift
@@ -94,9 +102,11 @@ if [ "$MODE" != "dry" ]; then
     if [ "$MS" = "17" ]; then
         ok "机器人       MotionState=17 (RL控制)"
     elif [ -n "$MS" ]; then
+        # 只拒绝、不动手。起立要人看着场地决定 —— 见文件头「只检查、不动作」。
         bad "机器人       MotionState=$MS —— 不是 RL 控制，轴指令会被静默忽略"
-        echo "        ${Y}先让狗起立${N}（在 .103 的网页上点【起立】，或跑：）"
+        echo "        ${Y}先让狗起立，再重跑本脚本${N}："
         echo "        $PY $DIR/motion_cmd.py --host $ROBOT --stand --go"
+        echo "        （狗在楼梯/不平地面时先确认场地安全再起立）"
         fail=1
     else
         bad "机器人       读不到状态 —— 运控没跑？地址不对？"

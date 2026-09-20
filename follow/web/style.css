@@ -1,0 +1,125 @@
+/* follow 观测界面 —— 只读。
+   视觉与 robot_dog_sdk/web/style.css 对齐（同一套调色板与卡片样式），
+   但去掉了所有控制类样式（方向键/摇杆/滑条/急停）—— 这个界面不发指令。 */
+
+:root {
+  --bg: #12151a;
+  --panel: #1b2027;
+  --panel2: #232a33;
+  --line: #2e3742;
+  --fg: #e6edf3;
+  --dim: #8b97a5;
+  --accent: #3b82f6;
+  --ok: #22c55e;
+  --warn: #f59e0b;
+  --err: #ef4444;
+  --danger: #dc2626;
+}
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+body {
+  margin: 0; padding: 0 12px 12px;
+  background: var(--bg); color: var(--fg);
+  font: 15px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  user-select: none;
+}
+
+header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 2px 10px;
+}
+h1 { font-size: 18px; margin: 0; font-weight: 600; }
+.tag {
+  font-size: 11px; color: var(--dim); border: 1px solid var(--line);
+  border-radius: 10px; padding: 1px 8px; margin-left: 6px; vertical-align: middle;
+}
+.conn { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--dim); }
+.dot {
+  width: 9px; height: 9px; border-radius: 50%; background: var(--dim);
+}
+.dot.on  { background: var(--ok); }
+.dot.off { background: var(--err); }
+
+.panel {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 12px; padding: 14px; margin-bottom: 12px;
+}
+.panel h2 {
+  font-size: 13px; font-weight: 600; color: var(--dim);
+  margin: 0 0 10px; letter-spacing: .05em;
+}
+
+/* ---- 顶部状态条 ---- */
+.status {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+  gap: 10px; padding: 12px 14px;
+}
+.stat label { display: block; font-size: 11px; color: var(--dim); }
+.stat b { font-size: 17px; font-variant-numeric: tabular-nums; }
+.stat i { font-size: 11px; color: var(--dim); font-style: normal; margin-left: 3px; }
+.stat b.ok   { color: var(--ok); }
+.stat b.warn { color: var(--warn); }
+.stat b.err  { color: var(--err); }
+
+/* ---- 故障 ---- */
+.faults {
+  background: #2a1416; border: 1px solid var(--err); color: #fecaca;
+  border-radius: 12px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px;
+}
+.faults b { color: #fff; }
+
+/* ---- 布局 ---- */
+main { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 720px) { main { grid-template-columns: 1fr; } }
+
+/* ---- 键值行（控制程序那些程序专属字段）---- */
+.kv { display: flex; justify-content: space-between; align-items: baseline;
+      padding: 5px 0; font-size: 13px; border-top: 1px solid #232a33; }
+.kv:first-child { border-top: none; }
+.kv .k { color: var(--dim); font-size: 12px; }
+.kv .v { font-variant-numeric: tabular-nums; font-weight: 600; }
+.kv .v.ok   { color: var(--ok); }
+.kv .v.warn { color: var(--warn); }
+.kv .v.err  { color: var(--err); }
+.kv .v.dim  { color: var(--dim); font-weight: 400; }
+
+/* ---- 关节温度 ---- */
+.tempHint { color: var(--dim); font-weight: 400; letter-spacing: 0; margin-left: 6px; }
+.tempGrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.tleg { background: var(--panel2); border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+.tleg h4 {
+  margin: 0; padding: 6px 8px; font-size: 12px; font-weight: 600;
+  background: #1a2029; color: var(--dim); text-align: center;
+  border-bottom: 1px solid var(--line);
+}
+.tleg.front h4 { color: #93c5fd; }
+.tleg.back  h4 { color: #c4b5fd; }
+.trow {
+  display: flex; justify-content: space-between; align-items: baseline;
+  padding: 5px 8px; font-size: 12px; border-top: 1px solid #232a33;
+}
+.trow:first-of-type { border-top: none; }
+.trow .tname { color: var(--dim); font-size: 11px; }
+.trow .tval { font-variant-numeric: tabular-nums; font-weight: 600; }
+.trow .tval.warn { color: var(--warn); }
+.trow .tval.hot  { color: var(--err); }
+.trow .tdrv { color: var(--dim); font-variant-numeric: tabular-nums; font-size: 11px; }
+.tLegend { margin-left: 10px; font-weight: 400; }
+.tLegend.warn { color: var(--warn); }
+.tLegend.hot  { color: var(--err); }
+@media (max-width: 620px) { .tempGrid { grid-template-columns: repeat(2, 1fr); } }
+
+.hidden { display: none !important; }
+
+/* ---- 日志 ---- */
+.log {
+  height: 160px; overflow-y: auto; font-size: 12px;
+  font-family: ui-monospace, Consolas, monospace; line-height: 1.6;
+}
+.log div { display: flex; gap: 8px; }
+.log time { color: var(--dim); flex: 0 0 auto; }
+.log .info  { color: var(--dim); }
+.log .ok    { color: var(--ok); }
+.log .warn  { color: var(--warn); }
+.log .error { color: var(--err); }
