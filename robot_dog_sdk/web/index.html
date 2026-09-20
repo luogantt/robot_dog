@@ -64,7 +64,9 @@
       <div class="joyhint">拖动摇杆<br><small>左右 = 转向　上下 = 前后</small></div>
     </div>
 
-    <p class="hint">按住按钮持续动，松手立即停。键盘：W/S 前后、A/D 转向、Q/E 平移、空格急停。</p>
+    <p class="hint warn">⚠️ <b>必须按住不放才会动</b>，松手立即停。
+      <b>点一下几乎没反应</b> —— 指令需要约 0.2 秒才爬出轴指令的死区。<br>
+      键盘：W/S 前后、A/D 转向、Q/E 平移、空格急停。</p>
   </section>
 
   <section class="panel">
@@ -73,8 +75,12 @@
       <input type="range" id="scale" min="2" max="60" value="15">
       <div class="sliderVal"><b id="scaleVal">0.15</b> <small>相对满速的比例</small></div>
     </div>
-    <p class="hint">起步建议先小后大。满速 1.00 对应文档 §1.2.6 给出的 ±1.67 m/s
-      （滑条上限由服务端 <code>--max-scale</code> 决定）。</p>
+    <p class="hint warn">⚠️ <b>滑条拉到 1.00</b>。<br>
+      <b>实测这台机器狗在低值区不响应、而且非单调</b>：<code>X=0.06</code> 能走
+      0.127 m/s，但 <code>0.12</code> 只有 0.027、<code>0.5</code> 只有 0.017；
+      转向则 <code>0.5/0.8</code> 几乎不转、只有 <code>1.0</code> 能转 180°/2s。
+      <b>滑条留在低位会表现为"点了没反应"。</b><br>
+      （滑条上限由服务端 <code>--max-scale</code> 决定；起步值由 <code>--scale</code> 决定）</p>
 
     <h2>步态切换</h2>
     <div id="gaits" class="btns"></div>
