@@ -91,6 +91,7 @@ def main():
     status = {}
     faults = []
     kinds = {}
+    device = {}          # 设备状态上报（电池/温度），Items 里有 DeviceTemperature
 
     try:
         while time.monotonic() - t0 < args.seconds:
@@ -127,6 +128,10 @@ def main():
             el = items.get("ErrorList")
             if isinstance(el, list):
                 faults = el
+            # 设备状态上报：Items 里是 DeviceTemperature / BatteryList / CPU
+            # （Type 实机是 0x0030 0002，文档写 0x0010 0002 —— 按 Items 判断两种都对）
+            if "DeviceTemperature" in items or "BatteryList" in items:
+                device = items
     finally:
         sock.close()
 
@@ -163,6 +168,27 @@ def main():
                   f"需先下发站立(§1.2.3)")
     else:
         print("\n（没解析到 BasicStatus）")
+
+    if device:
+        dt = device.get("DeviceTemperature") or {}
+        motor = list(dt.get("Motor") or [])
+        driver = list(dt.get("Driver") or [])
+        bats = device.get("BatteryList") or []
+        print("\n设备状态:")
+        if motor:
+            print(f"   电机温度   max={max(motor):.1f}  "
+                  f"({', '.join(f'{t:.0f}' for t in motor)})")
+        if driver:
+            print(f"   驱动器温度 max={max(driver):.1f}  "
+                  f"({', '.join(f'{t:.0f}' for t in driver)})")
+        for i, b in enumerate(bats):
+            if isinstance(b, dict):
+                print(f"   电池#{i}  电压={b.get('Voltage')}  "
+                      f"电量={b.get('BatteryLevel')}  "
+                      f"温度={b.get('battery_temperature')}  "
+                      f"充电中={b.get('charge')}")
+    else:
+        print("\n（未收到设备状态上报，无法读电池/温度）")
 
     if faults:
         worst = max((max(f.get("Severities") or [0]) for f in faults), default=0)

@@ -34,7 +34,20 @@ class FollowConfig:
     # 所以 max_vx=0.12 大约是 0.25 m/s。
     # （§1.2.6 标的 ±1.67 m/s 是真实轴指令的量程，和这里不是一回事，别混用）
     max_vx: float = 0.12            # 前进比例量上限 ≈ 0.25 m/s
-    max_wz: float = 0.12            # 转向比例量上限（转向标度尚未实测，先压小）
+    # 转向：实测 Yaw 通道【非单调】—— 0.5 → 21°，0.8 → 1.4°，1.0 → 180°。
+    # 中间值不可用，只有满量程能可靠起转。所以默认用开关式（bang-bang）
+    # 而不是比例式，绕开整条失效区间。
+    max_wz: float = 1.00            # 满量程 —— 唯一实测有效的值
+    yaw_bangbang: bool = True       # True=开关式；False=比例式(仅调试用)
+    yaw_deadband_deg: float = 8.0   # 方位误差小于这个角度就不转向，防抖
+    # 目标点是否沿 tag 法向量偏移 1 米（需求原话）。
+    # 默认【关】。原因有二，都是仿真实测出来的：
+    #  1) 法向量的 EMA 滤波会形成正反馈：狗一转身 → 滤波滞后 → 目标点
+    #     永远偏在死区外 → 无限原地打转。15Hz 下滞后 12.7°，调参修不掉。
+    #  2) 转向通道本身不可靠（只有满量程能起转，起转时刻不可预测）。
+    # 关掉后狗"直接朝 tag 走到 1 米"，同样满足"距 tag 1 米"这个目标，
+    # 且几乎不需要转向。代价：不会自动站到 tag 正前方（离理想点 0.24~0.72m）。
+    use_tag_normal: bool = False
     kp_dist: float = 1.0            # 前向误差(m) → 速度比例
     kp_yaw: float = 1.2             # 方位角(rad) → 角速度比例
     pos_deadband_m: float = 0.10    # 距目标点这么近就不再前进
@@ -126,13 +139,13 @@ class FollowController:
             return 0.0, 0.0, self.reason
 
         # --- 3) 追击：目标点 ---
-        if normal_g is not None:
+        if c.use_tag_normal and normal_g is not None:
             n = self._filter_normal(normal_g)
             src = "法向"
         else:
             n = -P / max(dist, 1e-6)
-            self.n_filt = None      # 法向断了就清滤波状态，免得下次把陈旧值混进来
-            src = "回退(法向不可靠)"
+            self.n_filt = None      # 不用法向/法向断了就清滤波状态
+            src = "直朝tag" if not c.use_tag_normal else "回退(法向不可靠)"
         T = P + c.target_dist_m * n
 
         ex, ey = float(T[0]), float(T[1])
@@ -140,10 +153,20 @@ class FollowController:
         if abs(ex) < c.pos_deadband_m:
             vx = 0.0
         heading = math.atan2(ey, ex)        # 左正 → 左转（Yaw 正 = 逆时针）
-        wz = float(np.clip(c.kp_yaw * heading, -c.max_wz, c.max_wz))
+        heading_deg = math.degrees(heading)
+        if c.yaw_bangbang:
+            # 开关式：死区内不转，否则满量程。
+            # 实测 Yaw 的中间值（0.5/0.8）不产生稳定转向，比例式无法工作。
+            wz = 0.0 if abs(heading_deg) < c.yaw_deadband_deg \
+                else math.copysign(c.max_wz, heading_deg)
+        else:
+            wz = float(np.clip(c.kp_yaw * heading, -c.max_wz, c.max_wz))
 
         vx = self._slew(vx, self.last_vx, c.max_accel_hz, dt)
-        wz = self._slew(wz, self.last_wz, c.max_yaw_rate_hz, dt)
+        if not c.yaw_bangbang:
+            # 开关式【不做】变化率限幅：实测 yaw 起转本身就慢且不可预测，
+            # 再加 0→1.0 要 0.33s 的爬升会把它拖得完全没反应。
+            wz = self._slew(wz, self.last_wz, c.max_yaw_rate_hz, dt)
         self.last_vx, self.last_wz = vx, wz
 
         self.reason = (f"追击[{src}] 距={dist:.2f}m "

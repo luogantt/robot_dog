@@ -43,13 +43,25 @@ MOTION_RL = 17
 
 AXES = ("X", "Y", "Z", "Roll", "Pitch", "Yaw")
 
-# 按轴分档的硬上限，不是一刀切 —— 理由是风险性质不同：
-#   X/Y 平移：标度已实测（0.06 → 0.127 m/s，满量程 ≈2.1 m/s）。
-#             0.15 ≈ 0.32 m/s，2 米场地够用，再大就要撞东西了。
-#   Yaw 旋转：原地转身不会撞到任何东西，风险等级完全不同，可以放更开。
-#   Z/Roll/Pitch：范围和单位文档都没给（§1.2.6 那列是"-"），保持最小。
-HARD_LIMIT = {"X": 0.15, "Y": 0.15, "Z": 0.08,
-              "Roll": 0.08, "Pitch": 0.08, "Yaw": 0.30}
+# 按轴分档的硬上限。依据不再是猜的，而是官方 SDK 源码里的满量程
+# （S10_sdk_deploy/interface/user_command/keyboard_interface.hpp:29-31）：
+#     max_forward_ = 1.0   max_side_ = 0.6   max_yaw_ = 1.0
+# 经 s10_policy_runner.hpp:207 缩放后变成物理量：
+#     forward × 1.5 → 1.5 m/s    side × 0.5 → 0.5 m/s    yaw × 0.6 → 0.6 rad/s
+# 官方键盘/手柄/DDS 三路输入都工作在满量程，输入范围是 [-1,1]。
+#
+# 而 robot_dog_sdk/web_control.py 里，网页端实际下发的是
+#     target = intent × scale × cap        （scale 默认 0.50，滑条上限 MAX_SCALE=1.0）
+# 也就是说网页端最猛能发到 ±1.0 —— 那是"已验证能用"的取值范围。
+#
+#   X 平移：放到 0.5。原以为 0.15 够了（按"0.06 → 0.127 m/s"的标度），
+#     但实测这个通道【非单调】：0.06 → 0.127 m/s，0.12 → 0.027 m/s
+#     （指令翻倍、速度掉到 1/5）。老标度作废，直接给到网页端默认量级。
+#   Y 侧移：放到 0.8。网页端默认就发 0.5，之前用 0.15 测当然没反应。
+#   Yaw 旋转：原地转身不会撞到任何东西，按官方满量程放开。
+#   Z/Roll/Pitch：文档 §1.2.6 那列是"-"，范围未知，保持最小。
+HARD_LIMIT = {"X": 0.50, "Y": 0.80, "Z": 0.08,
+              "Roll": 0.08, "Pitch": 0.08, "Yaw": 1.00}
 
 
 def build_axis(values, value=None):
@@ -155,6 +167,8 @@ def main():
     ap.add_argument("--kill-test", action="store_true",
                     help="发完直接杀进程、不归零（测看门狗）")
     ap.add_argument("--go", action="store_true", help="真的发指令")
+    ap.add_argument("--allow-clamp", action="store_true",
+                    help="值超出该轴硬上限时，允许按钳制值继续（默认直接拒绝）")
     args = ap.parse_args()
 
     want = {args.axis: args.value}
@@ -163,13 +177,23 @@ def main():
     if all(abs(x) < 1e-9 for x in want.values()):
         sys.exit("值不能全为 0 —— 那测不出任何东西")
 
-    send = {}
+    send, clamped_any = {}, []
     for a, x in want.items():
         lim = HARD_LIMIT[a]
         clamped = max(-lim, min(lim, x))
         if abs(clamped - x) > 1e-12:
-            print(f"[钳制] {a}: {x:+g} → {clamped:+g}（该轴硬上限 ±{lim}）")
+            clamped_any.append(f"{a}: {x:+g} → {clamped:+g}（上限 ±{lim}）")
         send[a] = clamped
+
+    # 钳制【不再静默通过】—— 否则你以为在测某个值，实际发的是另一个，
+    # 白跑一轮还拿到错误结论（这个坑已经踩过两次）。
+    if clamped_any:
+        for msg in clamped_any:
+            print(f"[钳制] {msg}")
+        if not args.allow_clamp:
+            print("\n[拒绝执行] 值被硬上限改写，实际发的和你要求的不一样。")
+            print("           改小参数，或确知后果时加 --allow-clamp 强制按钳制值发。")
+            return 4
 
     desc = "  ".join(f"{a}={x:+.3f}" for a, x in send.items())
     print(f"目标 {args.host}:{args.port}")
@@ -238,8 +262,11 @@ def main():
                       f"AngularZ={link.fx['AngularZ']:+.4f}")
                 last_trace = now
             next_t += period
-            if next_t > time.monotonic():
-                time.sleep(next_t - time.monotonic())
+            # 只读一次时钟再判断 —— 先比后算会让差值为负，sleep 抛
+            # ValueError 把整个线程打断（实机踩过，检测线程直接死掉）
+            _d = next_t - time.monotonic()
+            if _d > 0:
+                time.sleep(_d)
         print(f"  发了 {samples} 条，用时 {time.monotonic()-t0:.2f}s")
 
         if args.kill_test:

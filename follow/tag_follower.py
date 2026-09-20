@@ -130,10 +130,18 @@ class RobotLink:
     def heartbeat(self):
         self.sock.sendto(build_apdu(*CMD_HEARTBEAT, {}), self.target)
 
-    def pump(self):
-        """收包并更新状态。返回本周期收到的状态帧数。"""
+    def pump(self, max_wait=0.05):
+        """收包并更新状态。返回本周期收到的状态帧数。
+
+        max_wait: 本周期最多在这里花多少秒。默认 0.05 是单线程跟随循环的
+        老取值；20Hz 控制循环必须给更小的值（如 0.004），否则光收状态就
+        把整个周期占满 —— 实测 50ms → 控制循环只能跑到 10Hz。
+        状态帧是排队在 socket 缓冲里的，recvfrom 有数据就立即返回，
+        等得短不会丢帧。
+        """
+        self.sock.settimeout(max_wait)
         n = 0
-        deadline = time.monotonic() + 0.05
+        deadline = time.monotonic() + max_wait
         while time.monotonic() < deadline:
             try:
                 data, _ = self.sock.recvfrom(65535)
@@ -163,9 +171,10 @@ class RobotLink:
                 n += 1
         return n
 
-    def send_axis(self, x, yaw):
+    def send_axis(self, x, yaw, y=0.0):
+        """轴指令（§1.2.5）。y 是侧移，默认 0（老调用方不用改）。"""
         self.sock.sendto(build_apdu(*CMD_AXIS,
-                                    {"X": x, "Y": 0.0, "Z": 0.0,
+                                    {"X": x, "Y": y, "Z": 0.0,
                                      "Roll": 0.0, "Pitch": 0.0, "Yaw": yaw}),
                          self.target)
         self.axis_sent += 1
@@ -371,10 +380,13 @@ class TagFollower:
                         break
 
                 next_t += period
-                if next_t <= time.monotonic():
-                    next_t = time.monotonic()
+                # 只读一次时钟再判断：先比后算会让差值为负，sleep 抛
+                # ValueError（实机踩过，检测线程因此整个死掉）
+                _d = next_t - time.monotonic()
+                if _d > 0:
+                    time.sleep(_d)
                 else:
-                    time.sleep(next_t - time.monotonic())
+                    next_t = time.monotonic()
 
         except KeyboardInterrupt:
             print("\n[中断]")

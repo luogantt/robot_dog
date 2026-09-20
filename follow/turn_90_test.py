@@ -58,8 +58,10 @@ def main():
     ap.add_argument('--host',default='10.21.33.103')
     ap.add_argument('--port',type=int,default=30004)
     ap.add_argument('--degrees',type=float,default=90.0,help='正=左转，负=右转')
-    ap.add_argument('--yaw',type=float,default=0.20)
-    ap.add_argument('--slow-yaw',type=float,default=0.12)
+    ap.add_argument('--yaw',type=float,default=1.0,
+                    help='官方键盘转向用的就是满量程 1.0（×0.6 = 0.6 rad/s）。'
+                         '实测 0.20 几乎不转，别再用小值')
+    ap.add_argument('--slow-yaw',type=float,default=0.40)
     ap.add_argument('--slow-at',type=float,default=70.0)
     ap.add_argument('--timeout',type=float,default=8.0)
     ap.add_argument('--no-progress-time',type=float,default=3.0)
@@ -68,7 +70,7 @@ def main():
     ap.add_argument('--hz',type=float,default=20.0)
     ap.add_argument('--go',action='store_true')
     a=ap.parse_args()
-    if not (0<a.yaw<=0.30): raise SystemExit('--yaw 必须在 (0,0.30]')
+    if not (0<a.yaw<=1.0): raise SystemExit('--yaw 必须在 (0,1.0]')
     if not (0<a.slow_yaw<=a.yaw): raise SystemExit('--slow-yaw 必须 >0 且 <= --yaw')
     if not (1<=abs(a.degrees)<=180): raise SystemExit('--degrees 建议范围 1~180')
     direction=1.0 if a.degrees>0 else -1.0

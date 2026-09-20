@@ -99,7 +99,7 @@ def main():
     for i in range(20):
         vx, wz, why = run(c, pos, None, i * DT)
     check("仍然前进", vx > 0.05, f"vx={vx:+.3f}")
-    check("回退标记出现", "回退" in why, why)
+    check("走的是回退路径", "直朝tag" in why or "回退" in why, why)
 
     # ---------- 7) 距离跳变保护 ----------
     print("\n[7] 距离跳变保护")
@@ -135,6 +135,38 @@ def main():
           all(ramp[i + 1] - ramp[i] <= RATE * DT + 1e-9 for i in range(3)),
           f"最大增量 {max(ramp[i+1]-ramp[i] for i in range(3)):.4f} "
           f"≤ {RATE*DT:.4f}")
+
+    # ---------- 9) 开关式转向（实测 Yaw 中间值无效，只有满量程可用）----------
+    print("\n[9] 开关式转向（bang-bang）")
+    cfg = FollowConfig()
+    check("默认启用开关式", cfg.yaw_bangbang is True)
+    check("默认满量程", cfg.max_wz == 1.00, f"max_wz={cfg.max_wz}")
+
+    # 方位角小于死区 → 完全不转（防止在死区里来回摆）
+    c = FollowController(FollowConfig())
+    pos = (5.0, 0.30, -0.2)         # 3.4° 偏角，小于 8° 死区
+    for i in range(5):
+        vx, wz, why = run(c, pos, None, i * DT)
+    check("死区内不转向", wz == 0.0, f"偏角 {math.degrees(math.atan2(0.30,5.0)):.1f}° → wz={wz}")
+
+    # 超出死区 → 立即满量程（不受变化率限幅）
+    for deg, want in ((15.0, 1.0), (-15.0, -1.0)):
+        c = FollowController(FollowConfig())
+        r = math.radians(deg)
+        pos = (5.0, 5.0 * math.tan(r), -0.2)
+        run(c, pos, None, 0.0)                       # 先喂一帧
+        vx, wz, why = run(c, pos, None, DT)          # 第二帧
+        check(f"偏角 {deg:+.0f}° → 单帧到满量程 {want:+.1f}",
+              abs(wz - want) < 1e-9, f"wz={wz:+.3f}")
+
+    # 比例式仍可切回（调试用）
+    c = FollowController(FollowConfig(yaw_bangbang=False))
+    r = math.radians(3.0)                            # 小偏角
+    pos = (5.0, 5.0 * math.tan(r), -0.2)
+    for i in range(3):
+        vx, wz, why = run(c, pos, None, i * DT)
+    check("比例式仍可用（小值转向）", 0.0 < abs(wz) < 1.0,
+          f"wz={wz:+.3f}（开关式下这里会是 0）")
 
     # ---------- 汇总 ----------
     print(f"\n{'='*56}")
