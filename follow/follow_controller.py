@@ -34,6 +34,7 @@
 
 import argparse
 import os
+import signal
 import sys
 import threading
 import time
@@ -50,6 +51,21 @@ from d435i_tag_probe import (DEFAULT_TAG_SIZE_M, FAMILY,  # noqa: E402
                              tag_normal_ground, tag_side_px)
 from follow_law import FollowConfig, FollowController  # noqa: E402
 from tag_follower import RobotLink  # noqa: E402  复用已写好的 ASDU 客户端
+def install_sigterm_as_interrupt():
+    """让 SIGTERM 也走 KeyboardInterrupt 分支，触发 finally 里的归零。
+
+    Python 默认收到 SIGTERM 会【直接退出、不跑 finally】—— 而这些程序的
+    finally 里有"连续发零速"，不跑就等于停车指令发不出去。
+
+    而停服务的常规手段（kill、systemctl stop、部署脚本）用的都是 SIGTERM，
+    所以必须在这里接管。SIGINT（Ctrl+C）本来就会抛 KeyboardInterrupt。
+    """
+    def _handler(signum, frame):
+        raise KeyboardInterrupt
+    try:
+        signal.signal(signal.SIGTERM, _handler)
+    except (ValueError, OSError):
+        pass    # 非主线程调用时 signal.signal 会抛，忽略即可
 
 MOTION_RL = 17
 STATUS_STALE_S = 1.2        # 状态上报中断多久算断（BasicStatus 是 2Hz，容丢两帧）
@@ -145,7 +161,10 @@ class DetectorThread(threading.Thread):
                 next_t = time.monotonic()
 
 
+
+
 def main():
+    install_sigterm_as_interrupt()
     ap = argparse.ArgumentParser(description="AprilTag 跟随控制器（两线程解耦）")
     ap.add_argument("--robot", default="10.21.33.103", help="运控主机")
     ap.add_argument("--port", type=int, default=30004)
@@ -285,8 +304,13 @@ def main():
         if args.go:
             link.stop()
         link.close()
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+            rclpy.shutdown()
+        except Exception:
+            # 收到信号时 rclpy 可能已经自己关过了，重复关会抛 RCLError。
+            # 归零在它之前就发完了，这里崩掉只是收尾难看。
+            pass
         el = max(1e-9, time.monotonic() - t_start)
         print(f"结束：检测帧 {shared.frames}，命中 {shared.hits} "
               f"({100.0*shared.hits/max(1,shared.frames):.0f}%)  "

@@ -33,6 +33,7 @@ CMD_MOTION = (0x00100001, 0x00200002)   # §1.2.3 运动状态转换
 CMD_GAIT = (0x00100001, 0x00300002)     # §1.2.4 运动步态切换
 MOTION_RL = 17
 MOTION_STAND = 1
+MOTION_CROUCH = 4
 
 # §1.2.3：空闲(0) 与 软急停(-2) 仅支持查询，不能下发 —— 明确禁掉，
 # 免得写错参数把狗搞进未定义状态。
@@ -184,10 +185,14 @@ def main():
             link.pump(0.05)
             now = time.monotonic()
             if args.gait is None:
-                # 起立(1) 的终态是 RL 控制(17) —— 起身完成后会自动过去
-                # （§2.2.1 注）。只等 state==1 会永远等不到，误报超时。
+                # 等中间态会永远等不到，必须认终态（这两个都实测踩过）：
+                #   起立(1) → 终态是 RL 控制(17)（§2.2.1 注：起身后自动进入）
+                #   趴下(4) → 终态可能是 空闲(0)（实测：趴完落到 0 而不是 4）
                 reached = (link.motion_state == want
-                           or (want == 1 and link.motion_state == MOTION_RL))
+                           or (want == MOTION_STAND
+                               and link.motion_state == MOTION_RL)
+                           or (want == MOTION_CROUCH
+                               and link.motion_state == 0))
                 if reached:
                     print(f"✅ 到位：MotionState={want} "
                           f"({MOTION_NAMES.get(want, '?')})，用时 "
