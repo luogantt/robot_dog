@@ -37,6 +37,7 @@ import asyncio
 import json
 import os
 import queue
+import socket
 import threading
 import time
 from collections import deque
@@ -294,6 +295,9 @@ class ControlLoop(threading.Thread):
         self.teleop = teleop
         self.abort_severity = abort_severity
         self.observe = observe      # True = 只读观察：照常算 out，但一帧都不发出去
+        # 探测期间暂停控制循环 —— 必须保证"同一时刻只有一个发送源"，
+        # 否则 A/B 实验不干净（本控制循环是 20Hz 永久发送，空闲时发零速）。
+        self.paused = False
         self.yaw_sign = yaw_sign    # -1 = 实机实测方向，见 YAW_SIGN 注释
         self.running = True
         self.send_fail = 0
@@ -306,6 +310,10 @@ class ControlLoop(threading.Thread):
         period = 1.0 / CONTROL_HZ
         next_t = now()
         while self.running:
+            if self.paused:
+                # 探测模式：完全不发轴指令，保证同一时刻只有一个发送源
+                time.sleep(0.05)
+                continue
             try:
                 self.tick()
             except OSError as e:
@@ -409,6 +417,75 @@ class ControlLoop(threading.Thread):
             ms = status.get("MotionState")
             return f"未处于 RL 控制状态（当前 {ms} {MOTION_NAMES.get(ms, '?')}），请先起立"
         return ""
+
+
+# ============================================================
+# 轴指令直发探测（排查用，见 README 第 9 节）
+# ============================================================
+
+def direct_axis_probe(client, control, x, yaw, seconds=2.0, hz=20.0, dest=None):
+    """用【当前 RobotClient 自己的 socket】直接发轴指令，绕过 Teleop / 状态门 / 限幅。
+
+    为什么需要这个：
+        Web 控制循环一旦启动，就以 20Hz **永久**发送轴指令（空闲时发零速）。
+        所以拿另一个进程（如 axis_test.py）去对比时，网络上有 **两个源端口**
+        在同时往 30004 发 —— 实验是不干净的，无法区分"报文内容问题"和
+        "客户端身份/发送源问题"。
+
+        本函数在 **同一进程、同一 socket、且暂停 ControlLoop** 的前提下发指令，
+        把变量彻底收敛到"这条发送路径本身通不通"。
+
+    判读：
+        能动   → 协议、socket 身份、固件 client ownership 全部无罪，
+                 问题在 ControlLoop 的 Teleop→watchdog→slew→out 这条链上
+        不能动 → 问题在 socket 身份 / 源 IP:端口 / 固件 client ownership
+                 （再去研究 bind 与抓包才有意义）
+    """
+    control.paused = True                      # 先暂停控制循环
+    time.sleep(0.1)                            # 等它退出当前 tick
+    try:
+        log_event("warn", f"[探测] 暂停控制循环，直接用 RobotClient socket 发轴指令："
+                          f"X={x} Yaw={yaw}，{seconds:.1f}s @{hz:.0f}Hz")
+        log_event("info", f"[探测] 本机 socket = {client.local_endpoint()}  "
+                          f"目标 = {client.target}  (这就是机器人口中的'客户端身份')")
+        # 用 connect() 让内核解析路由 —— UDP 上 connect 不发包，但会定下
+        # 源 IP:端口。这台机器到 10.21.33.0/24 有【两条等价路由】
+        # （WLAN 3 / WLAN，metric 都是 1），不同 socket 可能选到不同网卡、
+        # 用不同源 IP —— 而机器人正是按源端点认客户端的。
+        try:
+            _t = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            _t.connect(client.target)
+            log_event("warn", f"[探测] ★ 本进程解析到的源端点 = {_t.getsockname()}"
+                              f"  → 机器人眼里的客户端就是它")
+            _t.close()
+        except OSError as e:
+            log_event("error", f"[探测] 路由解析失败: {e!r}")
+        # dest 给定时，改发到指定地址（用来验证"包到底出没出这个进程"：
+        # 发到本机监听端口，看能不能收到、源是什么）
+        target = tuple(dest) if dest else client.target
+        if dest:
+            log_event("warn", f"[探测] 改发到 {target}（不发给机器人）")
+
+        n = 0
+        end = now() + seconds
+        while now() < end:
+            apdu, _ = build_apdu(make_velocity(x, 0.0, 0.0, 0.0, 0.0, yaw,
+                                               command=CMD_AXIS))
+            client.sock.sendto(apdu, target)
+            n += 1
+            time.sleep(1.0 / hz)
+        for _ in range(10):                    # 连续归零
+            apdu, _ = build_apdu(make_velocity(0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                               command=CMD_AXIS))
+            client.sock.sendto(apdu, target)
+            time.sleep(0.05)
+        log_event("warn", f"[探测] 结束：发 {n} 帧轴指令 + 10 帧归零。"
+                          f"若机器人没动 → 问题在 socket 身份，不在控制循环")
+    except Exception as e:
+        log_event("error", f"[探测] 异常：{e!r}")
+    finally:
+        control.paused = False
+        log_event("info", "[探测] 已恢复控制循环")
 
 
 # ============================================================
@@ -644,6 +721,15 @@ def handle_client_msg(cid, msg):
     if t == "claim":
         teleop.claim(cid)
         log_event("info", f"客户端 {cid} 取得控制权")
+    elif t == "probe":
+        # 排查用：直接用 RobotClient 的 socket 发轴指令（绕过 ControlLoop）
+        #   {"t":"probe","x":-0.5,"yaw":0,"seconds":2}
+        threading.Thread(target=direct_axis_probe,
+                         args=(STATE["client"], STATE["control"],
+                               float(msg.get("x", 0.0)), float(msg.get("yaw", 0.0)),
+                               float(msg.get("seconds", 2.0))),
+                         kwargs={"dest": msg.get("dest")},
+                         daemon=True).start()
     elif t == "intent":
         reason = teleop.set_intent(cid, msg.get("x", 0), msg.get("y", 0), msg.get("yaw", 0))
         if reason:

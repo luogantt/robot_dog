@@ -268,7 +268,14 @@ class RobotClient:
         self.profile = profile
         self.target = (host, port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # 显式 bind：不是为了修 bug（未 bind 的 socket 在首次 sendto 后也会被
+        # 内核绑到 ephemeral 端口，且该端口在 socket 生命周期内不变），而是为了
+        # 【可观测】—— 启动时就能打印出本机的 source endpoint，
+        # 配合抓包可以确认"到机器人眼里的客户端身份"到底是什么。
+        # 排查"Web 发送路径 vs 机器人响应"时这条信息是必需的，见 README 第 9 节。
+        self.sock.bind(("0.0.0.0", 0))
         self.sock.settimeout(0.5)
+        log(f"[UDP] 本机 socket = {self.sock.getsockname()}  目标 = {self.target}")
 
         self._running = False
         self._closed = False
@@ -323,6 +330,17 @@ class RobotClient:
         if self._closed:
             raise OSError("socket 已关闭")
         self.sock.sendto(apdu, self.target)
+
+    def local_endpoint(self):
+        """本机 source endpoint。首次 sendto 后应变成 (真实IP, 端口)。
+
+        排查用：这个 IP:端口 就是机器人口中的"客户端身份"，
+        文档 §1.5 的 0xE006 判定依赖它。
+        """
+        try:
+            return self.sock.getsockname()
+        except OSError:
+            return None
 
     def send(self, body_dict, label=""):
         """单向发送，不等响应。"""
