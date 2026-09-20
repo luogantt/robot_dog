@@ -105,6 +105,7 @@ def build_apdu(type_, command, items):
 CMD_HEARTBEAT = (0x00100064, 0x00000005)
 CMD_MOTION = (0x00100001, 0x00200002)
 CMD_AXIS = (0x00100001, 0x00100002)
+CMD_GAIT = (0x00100001, 0x00300002)
 
 MOTION_RL = 17
 
@@ -178,6 +179,12 @@ class RobotLink:
                                      "Roll": 0.0, "Pitch": 0.0, "Yaw": yaw}),
                          self.target)
         self.axis_sent += 1
+
+    def send_gait(self, gait):
+        """步态切换（§1.2.4）。注意：必须在机器人【完全停止】后下发，
+        否则指令会被缓存、停稳后才执行 —— 调用方负责先停下。"""
+        self.sock.sendto(build_apdu(*CMD_GAIT,
+                                    {"GaitParam": int(gait)}), self.target)
 
     def stop(self, cycles=8, period=0.05):
         for _ in range(cycles):
