@@ -3,7 +3,9 @@
 用 `.102` 上的 **Intel RealSense D435i** 实时检测 AprilTag，根据 **tag 的 id**
 让机器狗执行对应动作（前进/后退/转向/侧移/停止/切步态），或者**跟着 tag 走**。
 
-> 本文是**运行手册**。设计原理、实测标定、踩过的坑见
+> **赶时间的话直接看 → [`QUICKSTART.md`](QUICKSTART.md)**（五步启动，一页速查）。
+>
+> 本文是**完整运行手册**。设计原理、实测标定、踩过的坑见
 > [`../TECHNICAL_REPORT.md`](../TECHNICAL_REPORT.md) 第 2 节。
 
 ---
