@@ -91,28 +91,6 @@ def tag_in_body(pose_t, mount=CAM_MOUNT_XYZ_M, pitch_deg=CAM_PITCH_DEG):
     return np.asarray(mount, dtype=float) + cam_to_body_R(pitch_deg) @ p_cam
 
 
-def tag_normal_ground(pose_R, pitch_deg=CAM_PITCH_DEG, min_len=0.25):
-    """tag 法向量投影到地面 → 机体系下的二维单位向量 (nx前, ny左)。
-
-    ★ 符号是【实测标定】出来的，不是照抄文档 ★
-    实测：tag 贴在椅背上、正面朝相机时，pose_R[:,2] 转到机体系后指向
-          (+0.98, +0.22) —— 即背离相机那一侧。所以 dt_apriltags 给的
-          z 轴是指向 tag 内部/背面，取反才是"tag 正面朝哪边"。
-    若不取反，目标点会落在 tag 后面，狗会径直冲过 tag。
-
-    min_len: 归一化前的水平分量模长下限。tag 接近平躺时法向量几乎竖直，
-             地面投影退化成抖动的噪声方向 —— 此时返回 None，调用方应
-             退回"直接朝 tag 走"，别用这个不可靠的方向。
-    """
-    n_cam = np.asarray(pose_R, dtype=float).reshape(3, 3)[:, 2]
-    n_body = cam_to_body_R(pitch_deg) @ n_cam
-    flat = np.array([-n_body[0], -n_body[1]])     # ← 取反，见上
-    norm = float(np.linalg.norm(flat))
-    if norm < min_len:          # 太"竖"了，投影不可靠
-        return None
-    return flat / norm
-
-
 # ---------------------------------------------------------------- 图像解码
 
 def imgmsg_to_bgr(msg):
@@ -258,7 +236,7 @@ def main():
         # ---- 汇总 ----
         print(f"\n{'='*62}")
         print(f"检测率 {hits}/{n} = {100.0*hits/max(1,n):.0f}%    "
-              f"tag_size 假设 = {args.tag_size*100:.0f}mm")
+              f"tag_size 假设 = {args.tag_size*1000:.0f}mm")
         if results:
             pxw = np.array([r["px_width"] for r in results])
             z = np.array([r["z"] for r in results])

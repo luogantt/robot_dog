@@ -145,10 +145,9 @@ class DetectorThread(threading.Thread):
             det_ms = (time.monotonic() - t0) * 1000.0
 
             if hit is not None:
-                self.shared.put(tag_in_body(hit.pose_t),
-                                tag_normal_ground(hit.pose_R), t0, det_ms)
+                self.shared.put(tag_in_body(hit.pose_t), t0, det_ms)
             else:
-                self.shared.put(None, None, t0, det_ms)
+                self.shared.put(None, t0, det_ms)
             self.shared.bump_frame(hit is not None)
 
             next_t += self.period

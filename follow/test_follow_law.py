@@ -6,9 +6,9 @@
 覆盖需求里的每一条：
   1) 看不见 → 不动
   2) 距离 <= 1m → 不动（不倒退）
-  3) 距离 >  1m → 追击，方向沿 tag 法向量的地面投影
+  3) 距离 >  1m → 追击，朝 tag 走
   4) 到达"距 tag 1m"的位置 → 停
-外加：转向方向、跳变保护、变化率限幅、法向不可靠时的回退。
+外加：转向方向、跳变保护、变化率限幅。
 """
 
 import math
@@ -26,15 +26,8 @@ def check(name, cond, detail=""):
         FAILED.append(name)
 
 
-def run(ctrl, pos, normal, t):
-    return ctrl.update(pos, normal, t)
-
-
-def toward_dog(pos):
-    """tag 法向量指向狗（tag 正面朝狗）时的地面投影单位向量。"""
-    x, y = pos[0], pos[1]
-    n = math.hypot(x, y)
-    return (-x / n, -y / n)
+def run(ctrl, pos, t):
+    return ctrl.update(pos, t)
 
 
 def main():
@@ -42,7 +35,7 @@ def main():
     print("\n[1] 看不见 tag")
     c = FollowController(FollowConfig())
     for i in range(5):
-        vx, wz, why = run(c, None, None, i * DT)
+        vx, wz, why = run(c, None, i * DT)
     check("无检测 → 零输出", vx == 0.0 and wz == 0.0, f"vx={vx} wz={wz}")
 
     # ---------- 2) 距离 <= 1m → 不动 ----------
@@ -71,13 +64,13 @@ def main():
     c = FollowController(FollowConfig())
     pos = (1.5, 1.3, -0.2)                     # tag 在左前方
     for i in range(20):
-        vx, wz, why = run(c, pos, toward_dog(pos), i * DT)
+        vx, wz, why = run(c, pos, i * DT)
     check("tag 在左 → wz > 0（左转）", wz > 0.05, f"wz={wz:+.3f}")
 
     c = FollowController(FollowConfig())
     pos = (1.5, -1.3, -0.2)                    # tag 在右前方
     for i in range(20):
-        vx, wz, why = run(c, pos, toward_dog(pos), i * DT)
+        vx, wz, why = run(c, pos, i * DT)
     check("tag 在右 → wz < 0（右转）", wz < -0.05, f"wz={wz:+.3f}")
 
     # ---------- 5) 目标点是"距 tag 1m"而不是"贴着 tag" ----------
@@ -136,8 +129,8 @@ def main():
           f"最大增量 {max(ramp[i+1]-ramp[i] for i in range(3)):.4f} "
           f"≤ {RATE*DT:.4f}")
 
-    # ---------- 9) 开关式转向（实测 Yaw 中间值无效，只有满量程可用）----------
-    print("\n[9] 开关式转向（bang-bang）")
+    # ---------- 8) 开关式转向（实测 Yaw 中间值无效，只有满量程可用）----------
+    print("\n[8] 开关式转向（bang-bang）")
     cfg = FollowConfig()
     check("默认启用开关式", cfg.yaw_bangbang is True)
     check("默认满量程", cfg.max_wz == 1.00, f"max_wz={cfg.max_wz}")
@@ -146,7 +139,7 @@ def main():
     c = FollowController(FollowConfig())
     pos = (5.0, 0.30, -0.2)         # 3.4° 偏角，小于 8° 死区
     for i in range(5):
-        vx, wz, why = run(c, pos, None, i * DT)
+        vx, wz, why = run(c, pos, i * DT)
     check("死区内不转向", wz == 0.0, f"偏角 {math.degrees(math.atan2(0.30,5.0)):.1f}° → wz={wz}")
 
     # 超出死区 → 立即满量程（不受变化率限幅）
@@ -154,8 +147,8 @@ def main():
         c = FollowController(FollowConfig())
         r = math.radians(deg)
         pos = (5.0, 5.0 * math.tan(r), -0.2)
-        run(c, pos, None, 0.0)                       # 先喂一帧
-        vx, wz, why = run(c, pos, None, DT)          # 第二帧
+        run(c, pos, 0.0)                             # 先喂一帧
+        vx, wz, why = run(c, pos, DT)                # 第二帧
         check(f"偏角 {deg:+.0f}° → 单帧到满量程 {want:+.1f}",
               abs(wz - want) < 1e-9, f"wz={wz:+.3f}")
 
@@ -164,7 +157,7 @@ def main():
     r = math.radians(3.0)                            # 小偏角
     pos = (5.0, 5.0 * math.tan(r), -0.2)
     for i in range(3):
-        vx, wz, why = run(c, pos, None, i * DT)
+        vx, wz, why = run(c, pos, i * DT)
     check("比例式仍可用（小值转向）", 0.0 < abs(wz) < 1.0,
           f"wz={wz:+.3f}（开关式下这里会是 0）")
 

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """跟随控制律的闭环仿真 —— 不碰真机，先看行为收不收敛。
 
-    python sim_follow.py                    # 默认：tag 正对，看收敛
-    python sim_follow.py --tag-yaw 12       # 复现实测：tag 贴歪 12 度
-    python sim_follow.py --tag-yaw 12 --show
+    python sim_follow.py                    # 看收敛
+    python sim_follow.py --show             # 逐步打印
 
 运动学模型（够用即可，不追求逼真）：
     前进 speed = vx × MAX_SPEED
@@ -31,8 +30,6 @@ def main():
     ap = argparse.ArgumentParser(description="跟随控制律闭环仿真")
     ap.add_argument("--tag-pos", type=float, nargs=2, default=[2.5, 0.0],
                     help="tag 在世界系的位置（狗初始在原点，朝 +X）")
-    ap.add_argument("--tag-yaw", type=float, default=0.0,
-                    help="tag 相对正对狗的偏航角（度）。实测那张贴歪约 12°")
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--max-speed", type=float, default=1.0, help="vx=1 时的 m/s")
     ap.add_argument("--max-yaw-rate", type=float, default=1.0,
@@ -42,20 +39,15 @@ def main():
     args = ap.parse_args()
 
     tag = np.array(args.tag_pos, dtype=float)
-    # tag 法向量指向狗（正对时是 -X），再叠加 --tag-yaw 的偏转
-    n_world = rot(np.array([-1.0, 0.0]), args.tag_yaw)
 
     dog = np.array([0.0, 0.0])
     psi = 0.0                                   # 朝向，0 = +X
     ctrl = FollowController(FollowConfig(target_dist_m=args.target))
 
-    print(f"tag 世界位置 {tag}  法向偏角 {args.tag_yaw:+.0f}°")
-    print(f"目标距离 {args.target:.2f}m   "
-          f"理想终点 = tag + {args.target:.1f}×法向 = "
-          f"{tag + args.target * n_world}")
+    print(f"tag 世界位置 {tag}  目标距离 {args.target:.2f}m")
     print()
 
-    # 收敛判据：不能比浮点相等（tag 歪时 ey 不是精确 0，wz 会残留 ~1e-4），
+    # 收敛判据：不用"输出为 0 就收敛"（开关式转向会在死区边界来回摆），
     # 改成"最近 SETTLE_WIN 步内位移和转角都几乎没变"。
     SETTLE_WIN = 30          # 2 秒
     SETTLE_EPS_M = 0.005
@@ -66,11 +58,8 @@ def main():
     for k in range(args.steps):
         # 世界 → 狗体系
         rel = rot(tag - dog, -math.degrees(psi))
-        n_body = rot(n_world, -math.degrees(psi))
-        n_g = n_body / max(float(np.linalg.norm(n_body)), 1e-9)
 
-        vx, wz, why = ctrl.update((rel[0], rel[1], 0.0), (n_g[0], n_g[1]),
-                                  k * DT)
+        vx, wz, why = ctrl.update((rel[0], rel[1], 0.0), k * DT)
         dist = float(np.linalg.norm(rel))
         hist.append((k * DT, dist, vx, wz, psi))
 
@@ -85,15 +74,15 @@ def main():
             moved = max(float(np.linalg.norm(p[0] - past[0][0])) for p in past)
             turned = max(abs(math.degrees(p[1] - past[0][1])) for p in past)
             if moved < SETTLE_EPS_M and turned < SETTLE_EPS_DEG:
-                err = float(np.linalg.norm(dog - (tag + args.target * n_world)))
-                if abs(dist - args.target) < 0.20:
+                err = abs(dist - args.target)
+                if err < 0.20:
                     print(f"\n✅ 收敛：t={k*DT:.2f}s 停在距 tag {dist:.3f}m 处")
-                    print(f"   位置 {dog}  朝向 {math.degrees(psi):+.1f}°")
-                    print(f"   与理想终点偏差 {err:.3f}m"
+                    print(f"   位置 {dog}  朝向 {math.degrees(psi):+.1f}°"
+                          f"  距目标偏差 {err:.3f}m"
                           f"（含 {FollowConfig().pos_deadband_m:.2f}m 位置死区）")
-                    return 0 if err < 0.20 else 1
+                    return 0
                 print(f"\n⚠️ 停稳了但停在 {dist:.2f}m，目标 {args.target:.2f}m "
-                      f"（差 {abs(dist-args.target):.2f}m）—— 卡住了")
+                      f"（差 {err:.2f}m）—— 卡住了")
                 return 1
 
         speed = vx * args.max_speed

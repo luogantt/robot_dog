@@ -9,10 +9,9 @@
   1) 看不见 tag                    → 输出零，不动
   2) 狗距 tag <= target_dist_m      → 输出零，不动（不倒退）
   3) 狗距 tag >  target_dist_m      → 追击
-       目标点 T = tag位置 + target × n
-       其中 n 是 tag 法向量在地面的投影（单位向量）
+       目标点 T = tag位置 + target × n，n = 沿 tag→狗 方向的单位向量
+       即"直接朝 tag 走到 target 距离"
        前进量 ∝ T 的前向分量，转向 ∝ T 的方位角
-     n 不可靠时退回 n = 沿 tag→狗 方向，等价于"直接朝 tag 走到 target 距离"
 
 坐标系：机体系，X 前 / Y 左 / Z 上，原点 = 机体几何中心。
 输出：vx, wz 为比例量 [-1,1]（对应 ASDU §1.2.5 轴指令的 X 和 Yaw）。
@@ -65,29 +64,12 @@ class FollowController:
 
     def __init__(self, cfg: FollowConfig):
         self.cfg = cfg
-        self.last_seen_t = 0.0
         self.last_pos = None
         self.last_vx = 0.0
         self.last_wz = 0.0
         self.last_t = None
         self.jump_strikes = 0
-        self.n_filt = None          # 法向量的低通状态
         self.reason = "init"
-
-    def _filter_normal(self, n):
-        """单位向量的指数滑动平均（球面上的近似）。alpha 越小越平滑。"""
-        a = float(np.clip(self.cfg.normal_ema_alpha, 0.0, 1.0))
-        if self.n_filt is None or a >= 1.0:
-            self.n_filt = np.asarray(n, dtype=float)
-            return self.n_filt
-        merged = (1.0 - a) * self.n_filt + a * np.asarray(n, dtype=float)
-        norm = float(np.linalg.norm(merged))
-        if norm < 1e-6:
-            # 平滑结果互相抵消（多半是符号在跳）——丢掉旧状态重新起步
-            self.n_filt = np.asarray(n, dtype=float)
-            return self.n_filt
-        self.n_filt = merged / norm
-        return self.n_filt
 
     def _slew(self, want, prev, rate_hz, dt):
         if dt <= 0:
@@ -95,8 +77,8 @@ class FollowController:
         step = rate_hz * dt
         return float(np.clip(want, prev - step, prev + step))
 
-    def update(self, pos_body, normal_g, now):
-        """pos_body: (前,左,上) 米 或 None；normal_g: (nx,ny) 单位向量 或 None。
+    def update(self, pos_body, now):
+        """pos_body: (前,左,上) 米 或 None。
 
         返回 (vx, wz, reason)。
         """
@@ -138,14 +120,9 @@ class FollowController:
             self.last_vx = self.last_wz = 0.0
             return 0.0, 0.0, self.reason
 
-        # --- 3) 追击：目标点 ---
-        if c.use_tag_normal and normal_g is not None:
-            n = self._filter_normal(normal_g)
-            src = "法向"
-        else:
-            n = -P / max(dist, 1e-6)
-            self.n_filt = None      # 不用法向/法向断了就清滤波状态
-            src = "直朝tag" if not c.use_tag_normal else "回退(法向不可靠)"
+        # --- 3) 追击：目标点 = tag 位置 + target × (tag→狗 方向) ---
+        # 即"直接朝 tag 走到 target 距离"。法向量偏移方案已移除，见 FollowConfig。
+        n = -P / max(dist, 1e-6)
         T = P + c.target_dist_m * n
 
         ex, ey = float(T[0]), float(T[1])
@@ -169,6 +146,6 @@ class FollowController:
             wz = self._slew(wz, self.last_wz, c.max_yaw_rate_hz, dt)
         self.last_vx, self.last_wz = vx, wz
 
-        self.reason = (f"追击[{src}] 距={dist:.2f}m "
+        self.reason = (f"追击 距={dist:.2f}m "
                        f"目标点=({ex:+.2f},{ey:+.2f})")
         return vx, wz, self.reason
