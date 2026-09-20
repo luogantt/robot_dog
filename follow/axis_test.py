@@ -52,10 +52,17 @@ HARD_LIMIT = {"X": 0.15, "Y": 0.15, "Z": 0.08,
               "Roll": 0.08, "Pitch": 0.08, "Yaw": 0.30}
 
 
-def build_axis(values):
-    """§1.2.5 运动控制（轴指令）。values 是 {轴名: 值} 的字典，其余轴填 0。"""
+def build_axis(values, value=None):
+    """§1.2.5 运动控制（轴指令）。未指定的轴一律填 0。
+
+    两种调用方式都支持，因为两个脚本的用法不同：
+        build_axis("Yaw", 0.2)                  ← turn_90_test.py
+        build_axis({"X": 0.06, "Yaw": 0.15})    ← 本文件的 CLI（双轴）
+    """
     import json
     from datetime import datetime
+    if isinstance(values, str):
+        values = {values: 0.0 if value is None else float(value)}
     items = {a: 0.0 for a in AXES}
     for k, v in values.items():
         items[k] = float(v)
