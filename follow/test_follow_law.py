@@ -141,18 +141,22 @@ def main():
     check("死区内不转向", wz == 0.0,
           f"偏角 {math.degrees(math.atan2(0.30,5.0)):.1f}° → wz={wz}")
 
-    # 比例式：偏角越大转得越快，且单调
+    # 比例式：偏角越大转得越快（取【非饱和段】—— kp_yaw=3.5 时约 20° 就封顶，
+    # 用 25°/35° 会因为都饱和在 1.0 而"看起来不递增"）
     outs = []
-    for deg in (15.0, 25.0, 35.0):
+    for deg in (8.0, 12.0, 16.0):
         c = FollowController(FollowConfig())
         r = math.radians(deg)
         pos = (5.0, 5.0 * math.tan(r), -0.2)
         for i in range(6):
             vx, wz, why = run(c, pos, i * DT)
         outs.append(wz)
-    check("比例式：偏角越大 wz 越大（单调）",
+    check("比例式：偏角越大 wz 越大（非饱和段单调）",
           all(outs[i] < outs[i + 1] for i in range(2)),
           " → ".join(f"{v:+.3f}" for v in outs))
+    check("比例式在大于死区下沿的偏角处【确实会转】",
+          all(o >= FollowConfig().yaw_dead_hi for o in outs),
+          f"8° → {outs[0]:+.3f} ≥ {FollowConfig().yaw_dead_hi}")
 
     # ★ 死区跃迁：算出的中间值落在 Yaw 死区（0.33~0.45）里时必须跳过，
     #   不能原样发出去 —— 原样发出去机器人会「时转时不转」，跟随一顿一顿。
