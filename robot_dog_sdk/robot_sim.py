@@ -34,6 +34,7 @@ HDR = 16
 
 # ---- 枚举（照抄文档）----
 GAIT_BASIC_CTRL = 0x1001   # 基础（常规运动模式）
+GAIT_PLATFORM_CTRL = 0x1002  # 高台（常规运动模式）—— 文档没列这个值，见 web_control.py
 GAIT_STAIR_CTRL = 0x1003   # 楼梯（常规运动模式）
 GAIT_FLAT_NAV = 0x3002     # 平地（导航运动模式）
 GAIT_STAIR_NAV = 0x3003    # 楼梯（导航运动模式）
@@ -196,8 +197,9 @@ class RobotSim(threading.Thread):
         self.gait = g
         if g in (GAIT_FLAT_NAV, GAIT_STAIR_NAV):
             self.usage_mode = 1
-        elif g in (GAIT_BASIC_CTRL, GAIT_STAIR_CTRL):
+        elif g in (GAIT_BASIC_CTRL, GAIT_PLATFORM_CTRL, GAIT_STAIR_CTRL):
             self.usage_mode = 0
+        # 其它值：不改 usage_mode（文档外的步态，行为未知 —— 模拟器不猜）
 
     def log(self, msg):
         print(msg, flush=True)
