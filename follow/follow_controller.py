@@ -225,6 +225,11 @@ def main():
                          "命中的位置继续闭环。默认 1.0 是照【实测约 1s 的起步时间】"
                          "定的 —— 宽限小于它的话，任何一次漏检都要重新爬坡，指令会"
                          "被打成碎片。代价：真丢了 tag 之后仍会按最后位置多动这么久")
+    ap.add_argument("--ki-dist", type=float, default=_d.ki_dist,
+                    help=f"距离误差的积分增益（默认 {_d.ki_dist}）。追【移动】目标"
+                         f"的关键：纯 P 会有稳态滞后（人跑 1.5m/s 时狗落到 1.9m 外，"
+                         f"超出相机 1.5m 上限），积分器会自己爬到维持跟随所需的速度。"
+                         f"0 = 关掉（退回纯 P，只适合追静止目标）")
     ap.add_argument("--duration", type=float, default=0.0, help="0=一直跑")
     ap.add_argument("--web-port", type=int, default=8010,
                     help="只读观测界面的端口 → http://<本机>:端口/ 。0 = 不开界面")
@@ -234,7 +239,8 @@ def main():
         print("[说明] --max-wz 0：转向完全关闭，只直着走")
 
     cfg = FollowConfig(tag_id=args.tag_id, target_dist_m=args.target,
-                       max_vx=args.max_vx, max_wz=args.max_wz)
+                       max_vx=args.max_vx, max_wz=args.max_wz,
+                       ki_dist=args.ki_dist)
     ctrl = FollowController(cfg)
     shared = SharedTarget()
     cam = web_view.CamStats()

@@ -81,8 +81,15 @@ def main():
     for _ in range(300):
         vx, wz, why = run(c, pos, t)
         t += DT
-        pos = (max(pos[0] - vx * 1.0, 0.05), pos[1], pos[2])   # 假设 vx=1 → 1m/s
-    check("收敛到 ~1m 附近停下", 0.95 <= pos[0] <= 1.35, f"停在 {pos[0]:.2f}m")
+        # 运动学模型：vx=1 → 满量程 1.714 m/s（实测标度），必须乘 DT。
+        # ⚠️ 原来漏了 DT（每步走 vx 米）—— max_vx 小的时候侥幸能过，
+        #    提到 0.9 就每步走 0.9m、直接冲过头，暴露了模型是错的。
+        pos = (max(pos[0] - vx * 1.714 * DT, 0.05), pos[1], pos[2])
+    # 容差要覆盖【测试模型的步长】：这里是"先算 vx、再按 vx 走一整步"，
+    # 而 vx 最大 0.9 → 一步最多 0.1m，所以落点必然在 target 附近 ±0.1m 内。
+    # 真实系统里"到位→立即发零"下个周期（50ms）就生效，过冲只有约 5cm。
+    check("收敛到 target 附近停下（±模型步长）", 0.85 <= pos[0] <= 1.35,
+          f"停在 {pos[0]:.2f}m（target 1.00m）")
     check("停下时输出为零", abs(vx) < 1e-9 and abs(wz) < 1e-9, f"vx={vx} wz={wz}")
 
     # ---------- 6) 距离跳变保护 ----------
@@ -120,37 +127,73 @@ def main():
           f"最大增量 {max(ramp[i+1]-ramp[i] for i in range(3)):.4f} "
           f"≤ {RATE*DT:.4f}")
 
-    # ---------- 8) 开关式转向（实测 Yaw 中间值无效，只有满量程可用）----------
-    print("\n[8] 开关式转向（bang-bang）")
+    # ---------- 8) 转向模式：默认比例式，开关式仍可切 ----------
+    print("\n[8] 转向模式")
     cfg = FollowConfig()
-    check("默认启用开关式", cfg.yaw_bangbang is True)
-    check("默认满量程", cfg.max_wz == 1.00, f"max_wz={cfg.max_wz}")
+    check("默认【比例式】（跟随用）", cfg.yaw_bangbang is False)
+    check("转向上限 1.0", cfg.max_wz == 1.00, f"max_wz={cfg.max_wz}")
 
-    # 方位角小于死区 → 完全不转（防止在死区里来回摆）
+    # 死区内完全不转（两种模式都该如此）
     c = FollowController(FollowConfig())
-    pos = (5.0, 0.30, -0.2)         # 3.4° 偏角，小于 8° 死区
+    pos = (5.0, 0.30, -0.2)         # 3.4° 偏角，小于 5° 死区
     for i in range(5):
         vx, wz, why = run(c, pos, i * DT)
-    check("死区内不转向", wz == 0.0, f"偏角 {math.degrees(math.atan2(0.30,5.0)):.1f}° → wz={wz}")
+    check("死区内不转向", wz == 0.0,
+          f"偏角 {math.degrees(math.atan2(0.30,5.0)):.1f}° → wz={wz}")
 
-    # 超出死区 → 立即满量程（不受变化率限幅）
-    for deg, want in ((15.0, 1.0), (-15.0, -1.0)):
+    # 比例式：偏角越大转得越快，且单调
+    outs = []
+    for deg in (8.0, 20.0, 35.0):
         c = FollowController(FollowConfig())
         r = math.radians(deg)
         pos = (5.0, 5.0 * math.tan(r), -0.2)
-        run(c, pos, 0.0)                             # 先喂一帧
-        vx, wz, why = run(c, pos, DT)                # 第二帧
-        check(f"偏角 {deg:+.0f}° → 单帧到满量程 {want:+.1f}",
-              abs(wz - want) < 1e-9, f"wz={wz:+.3f}")
+        for i in range(6):
+            vx, wz, why = run(c, pos, i * DT)
+        outs.append(wz)
+    check("比例式：偏角越大 wz 越大（单调）",
+          all(outs[i] < outs[i + 1] for i in range(2)),
+          " → ".join(f"{v:+.3f}" for v in outs))
+    check("比例式小偏角给【中间值】（不是 0 也不是满值）",
+          0.0 < outs[0] < FollowConfig().max_wz,
+          f"8° → wz={outs[0]:+.3f}（开关式下这里是 {FollowConfig().max_wz:+.1f}）")
 
-    # 比例式仍可切回（调试用）
-    c = FollowController(FollowConfig(yaw_bangbang=False))
-    r = math.radians(3.0)                            # 小偏角
+    # 开关式仍可切（实验用）
+    c = FollowController(FollowConfig(yaw_bangbang=True))
+    r = math.radians(15.0)
     pos = (5.0, 5.0 * math.tan(r), -0.2)
-    for i in range(3):
-        vx, wz, why = run(c, pos, i * DT)
-    check("比例式仍可用（小值转向）", 0.0 < abs(wz) < 1.0,
-          f"wz={wz:+.3f}（开关式下这里会是 0）")
+    run(c, pos, 0.0)                             # 先喂一帧
+    vx, wz, why = run(c, pos, DT)                # 第二帧
+    check("开关式：死区外单帧到满量程", abs(wz - 1.0) < 1e-9, f"wz={wz:+.3f}")
+
+    # ---------- 9) 距离误差积分（追【移动】目标的关键）----------
+    print("\n[9] 距离误差积分（PI 里的 I）")
+    # 目标以 1.5 m/s 匀速远离，狗按指令速度走。
+    # 纯 P 的稳态距离 = target + v/满速 ≈ 1.9m —— 超出相机 1.5m 上限，
+    # 于是越落越远 → 丢 tag → 停 → 你跑回来 → 再追（死循环）。
+    # 有 I 项时积分器会爬到"维持 1.5 m/s 所需的速度"上，误差归零。
+    FULL = 1.714          # 满量程 m/s（实测标度）
+    TAG_V = 1.5           # 目标远离速度
+
+    def chase(ki, steps=500):
+        c = FollowController(FollowConfig(ki_dist=ki))
+        dog, tag, t = 0.0, 1.0, 0.0
+        for _ in range(steps):
+            vx, wz, why = run(c, (tag - dog, 0.0, -0.2), t)
+            dog += vx * FULL * DT          # 狗按指令速度走（满量程 × 比例量）
+            tag += TAG_V * DT              # 目标匀速远离
+            t += DT
+        return dog, tag
+
+    d_i, t_i = chase(FollowConfig().ki_dist)
+    d_p, t_p = chase(0.0)
+    gap_i, gap_p = t_i - d_i, t_p - d_p
+    check("有 I：稳态距离回到 target 附近（<1.5m 相机上限）",
+          gap_i < 1.5, f"{gap_i:.2f}m")
+    check("无 I：确实落后更多（对照）",
+          gap_p > gap_i + 0.2, f"{gap_p:.2f}m（有 I 时 {gap_i:.2f}m）")
+    check("I 增益与限幅都够用（限幅 ≥ 满量程，否则顶死追不上）",
+          0.0 < FollowConfig().ki_dist and FollowConfig().int_limit >= 1.0,
+          f"ki={FollowConfig().ki_dist} limit={FollowConfig().int_limit}")
 
     # ---------- 汇总 ----------
     print(f"\n{'='*56}")
