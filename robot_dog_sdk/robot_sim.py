@@ -34,7 +34,7 @@ HDR = 16
 
 # ---- 枚举（照抄文档）----
 GAIT_BASIC_CTRL = 0x1001   # 基础（常规运动模式）
-GAIT_PLATFORM_CTRL = 0x1002  # 高台（常规运动模式）—— 文档没列这个值，见 web_control.py
+GAIT_PLATFORM_CTRL = 0x1002  # 高台（常规运动模式）—— 文档没列，2026-09-21 实机验证过
 GAIT_STAIR_CTRL = 0x1003   # 楼梯（常规运动模式）
 GAIT_FLAT_NAV = 0x3002     # 平地（导航运动模式）
 GAIT_STAIR_NAV = 0x3003    # 楼梯（导航运动模式）
