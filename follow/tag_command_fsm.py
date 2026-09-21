@@ -62,7 +62,8 @@ from dt_apriltags import Detector
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from d435i_tag_probe import (DEFAULT_TAG_SIZE_M, FAMILY,  # noqa: E402
-                             Probe, imgmsg_to_bgr, tag_side_px)
+                             Probe, imgmsg_to_bgr, tag_in_body, tag_side_px)
+from follow_law import FollowConfig, FollowController  # noqa: E402
 from tag_follower import RobotLink  # noqa: E402
 import web_view  # noqa: E402
 
@@ -182,8 +183,10 @@ class SharedTag:
         self.lock = threading.Lock()
         self.tag_id = None       # 本帧命中的 id；漏检帧为 None
         self.px = 0.0
+        self.pose_t = None       # 本帧 tag 在【相机光学系】下的位置（米）
         self.good_id = None      # 最后一次命中，供漏检宽限期沿用
         self.good_px = 0.0
+        self.good_pose_t = None  # 最后一次命中的位置（"前进=跟随"要用）
         self.frame_ts = 0.0
         self.good_ts = 0.0       # 0 = 从未命中
         self.frames = 0
@@ -191,20 +194,22 @@ class SharedTag:
         self.det_ms = 0.0        # 最近一帧的解算耗时（观测界面用）
         self.seen_counts = {}    # 本次运行各 id 命中次数
 
-    def put(self, tag_id, px, now, det_ms=0.0):
+    def put(self, tag_id, px, pose_t, now, det_ms=0.0):
         with self.lock:
             self.tag_id, self.px, self.frame_ts = tag_id, px, now
+            self.pose_t = pose_t
             self.frames += 1
             self.det_ms = det_ms
             if tag_id is not None:
                 self.good_id, self.good_px, self.good_ts = tag_id, px, now
+                self.good_pose_t = pose_t
                 self.hits += 1
                 self.seen_counts[tag_id] = self.seen_counts.get(tag_id, 0) + 1
 
     def get(self):
         with self.lock:
             return (self.tag_id, self.px, self.frame_ts, self.good_ts,
-                    self.good_id, self.good_px, self.det_ms)
+                    self.good_id, self.good_px, self.det_ms, self.good_pose_t)
 
     def stats(self):
         with self.lock:
@@ -222,16 +227,20 @@ def log_state(msg):
 
 
 def detect_cmd_tag(det, gray, fx, fy, cx0, cy0, tag_size, min_px):
-    """检测画面里所有【在动作表里】的 tag，返回最大的那个 (id, 像宽)。
+    """检测画面里所有【在动作表里】的 tag，返回最大的那个 (id, 像宽, pose_t)。
 
     多个指令 tag 同时出现时取画面最大的 —— 最近的通常最可靠。
     min_px 用来挡掉远处的小 tag（过小容易误检）。
+
+    pose_t 是 tag 在【相机光学系】下的位置（米）。"前进"那个状态要按跟随
+    策略算控制量，需要这个位置，所以一并返回（反正 estimate_tag_pose 本来
+    就开着，不多花代价）。
     """
     res = det.detect(gray, estimate_tag_pose=True,
                      camera_params=[fx, fy, cx0, cy0], tag_size=tag_size)
     if not res:
-        return None, 0.0
-    best, best_px = None, 0.0
+        return None, 0.0, None
+    best, best_px, best_t = None, 0.0, None
     for r in res:
         tid = int(r.tag_id)
         if tid not in TAG_ACTIONS:
@@ -240,8 +249,8 @@ def detect_cmd_tag(det, gray, fx, fy, cx0, cy0, tag_size, min_px):
         if w < min_px:
             continue
         if w > best_px:
-            best, best_px = tid, w
-    return best, best_px
+            best, best_px, best_t = tid, w, r.pose_t
+    return best, best_px, best_t
 
 
 class DetectorThread(threading.Thread):
@@ -281,11 +290,11 @@ class DetectorThread(threading.Thread):
             bgr = imgmsg_to_bgr(msg)
             gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
             t0 = time.monotonic()
-            tid, px = detect_cmd_tag(self.det, gray, self.fx, self.fy,
-                                     self.cx0, self.cy0, self.tag_size,
-                                     self.min_px)
+            tid, px, pose_t = detect_cmd_tag(self.det, gray, self.fx, self.fy,
+                                             self.cx0, self.cy0, self.tag_size,
+                                             self.min_px)
             det_ms = (time.monotonic() - t0) * 1000.0
-            self.shared.put(tid, px, time.monotonic(), det_ms)
+            self.shared.put(tid, px, pose_t, time.monotonic(), det_ms)
 
             next_t += self.period
             # 只读一次时钟再判断 —— 先比后算会让差值为负，sleep 抛
@@ -340,6 +349,11 @@ def main():
                          "（退回「举多久转多久」）")
     ap.add_argument("--turn-timeout", type=float, default=6.0,
                     help="定角转向超时（秒）：这么久还没转够就停，防卡死")
+    ap.add_argument("--follow-tag", type=int, default=1,
+                    help="哪个 tag 当「前进」用 —— 它走【跟随策略】：朝 tag 走、"
+                         "边走边转（不是直着冲）。0 = 关掉跟随，退回「直着走」")
+    ap.add_argument("--follow-target", type=float, default=1.0,
+                    help="跟随策略的目标距离（米）：走到离 tag 这么近就停")
     args = ap.parse_args()
 
     mag = {"x": args.mag_x, "y": args.mag_y, "yaw": args.mag_yaw}
@@ -355,6 +369,11 @@ def main():
 
     shared = SharedTag()
     cam = web_view.CamStats()
+    # 「前进」状态用跟随策略实现：复用 follow_law 的 PI 控制律
+    # （追移动目标不落后、转向是比例式不是开关式）。--follow-tag 0 = 关掉。
+    follow_ctrl = FollowController(
+        FollowConfig(tag_id=args.follow_tag,
+                     target_dist_m=args.follow_target))
     # 观测界面要的快照：HTTP 线程读、主循环写。锁只保护一次整体赋值。
     view_lock = threading.Lock()
     view_state = {"name": "启动中", "out": {}, "tgt": "", "gate": "",
@@ -373,6 +392,11 @@ def main():
           f"控制 {args.hz:.0f}Hz / 检测 ≤{args.det_hz:.0f}Hz  "
           f"漏检宽限 {args.lost_timeout*1000:.0f}ms  "
           f"状态中断阈值 {STATUS_STALE_S*1000:.0f}ms")
+    if args.follow_tag:
+        print(f"「前进」= 跟随策略：tag {args.follow_tag} 朝它走、边走边转，"
+              f"走到 {args.follow_target:.1f}m 停（--follow-tag 0 可关掉退回直走）")
+    else:
+        print("「前进」= 直走（跟随策略已关）")
     if args.turn_deg > 0:
         print(f"定角转向：举一次 tag 3/61 转 {args.turn_deg:.0f}° 就自动停，"
               f"要再转请把 tag 拿开重举（超时 {args.turn_timeout:.0f}s）")
@@ -531,7 +555,8 @@ def main():
                 ang_last_t, ang_last_wz, ang_last_seq = st, wz, link.motion_seq
 
             # ---- 读最新 tag ----
-            tid, px, frame_ts, good_ts, good_id, good_px, det_ms = shared.get()
+            (tid, px, frame_ts, good_ts, good_id, good_px, det_ms,
+             good_pose_t) = shared.get()
             # 过期判断用【最后一次真的命中】的时间，不是最后一帧的时间。
             # 漏检但在宽限期内 → 沿用上次的 tag，指令保持连续（关键：机器人
             # 要约 1 秒连续指令才能起速，指令一碎就走不起来）
@@ -554,8 +579,22 @@ def main():
                 name, kind, axis, s = TAG_ACTIONS[tid]
 
             out = {"x": 0.0, "y": 0.0, "yaw": 0.0}
+            extra = ""          # 每秒状态行里额外显示的东西（跟随的 reason）
 
-            if kind == AXIS:
+            if tid is not None and args.follow_tag and tid == args.follow_tag:
+                # ---- 「前进」= 跟随策略 ----
+                # 不再是"直着冲"：同时算前进量 vx 与转向量 wz，所以你横向
+                # 走它会边前进边转过来。控制律来自 follow_law.py（PI + 比例转向）。
+                # 看不见 tag 时 pos_body 为 None → 控制律输出零（保持"看不见就不动"）。
+                pos_body = (tag_in_body(good_pose_t)
+                            if good_pose_t is not None else None)
+                vx, wz, fwhy = follow_ctrl.update(pos_body, now)
+                out["x"], out["yaw"] = vx, wz
+                name = "前进(跟随)"
+                extra = fwhy
+                gait_phase = "idle"
+                turn_phase = "idle"
+            elif kind == AXIS:
                 out[axis] = s * sign[axis] * mag[axis]
                 gait_phase = "idle"
                 if axis != "yaw":
@@ -691,7 +730,8 @@ def main():
                       f"检测{shared.stats()[0]/(now-t_start):4.1f}Hz | "
                       f"tag={tid if tid is not None else '无'} [{tgt}] | "
                       f"X={out['x']:+.3f} Y={out['y']:+.3f} "
-                      f"Yaw={out['yaw']:+.3f} | {name}")
+                      f"Yaw={out['yaw']:+.3f} | {name}"
+                      + (f"  {extra}" if extra else ""))
                 last_print = now
 
             next_t += period
