@@ -45,6 +45,7 @@
 """
 
 import argparse
+import math
 import os
 import signal
 import sys
@@ -333,6 +334,12 @@ def main():
     ap.add_argument("--sign-yaw", type=float, default=1.0, choices=(1.0, -1.0))
     ap.add_argument("--web-port", type=int, default=8010,
                     help="只读观测界面的端口 → http://<本机>:端口/ 。0 = 不开界面")
+    ap.add_argument("--turn-deg", type=float, default=30.0,
+                    help="定角转向：每举一次转向 tag（3/61）转过的角度（度）。"
+                         "转够就自动停，要再转把 tag 拿开重举。0 = 关掉定角"
+                         "（退回「举多久转多久」）")
+    ap.add_argument("--turn-timeout", type=float, default=6.0,
+                    help="定角转向超时（秒）：这么久还没转够就停，防卡死")
     args = ap.parse_args()
 
     mag = {"x": args.mag_x, "y": args.mag_y, "yaw": args.mag_yaw}
@@ -366,6 +373,11 @@ def main():
           f"控制 {args.hz:.0f}Hz / 检测 ≤{args.det_hz:.0f}Hz  "
           f"漏检宽限 {args.lost_timeout*1000:.0f}ms  "
           f"状态中断阈值 {STATUS_STALE_S*1000:.0f}ms")
+    if args.turn_deg > 0:
+        print(f"定角转向：举一次 tag 3/61 转 {args.turn_deg:.0f}° 就自动停，"
+              f"要再转请把 tag 拿开重举（超时 {args.turn_timeout:.0f}s）")
+    else:
+        print("定角转向：关（转向 tag 举多久转多久）")
     print("动作表：")
     for tid in sorted(TAG_ACTIONS):
         name, kind, axis, s = TAG_ACTIONS[tid]
@@ -429,6 +441,18 @@ def main():
         gait_target = None           # 本次切换的目标步态值；换目标就重跑流程
         gait_t0 = 0.0
         gait_sent_t = 0.0
+        # 定角转向子状态机（见循环里的 yaw 分支）。
+        # 思路来自 turn_90_test.py：积分 MotionStatus.AngularZ 算出【真实转过的
+        # 角度】，转够目标就停 —— 不依赖转速恒定（Yaw 通道本来就不稳，
+        # 实测 0.35~0.40 是死区、0.25 有 40% 不转，所以必须闭环到实测角度）。
+        turn_phase = "idle"          # idle | turning | done
+        turn_tag = None              # 是哪张转向 tag 起的头（左↔右 换了要重来）
+        turn_angle = 0.0             # 本次已转过的角度（弧度，带符号）
+        turn_target = 0.0            # 本次目标角（弧度，带符号）
+        turn_t0 = 0.0
+        ang_last_seq = 0             # 角度积分状态
+        ang_last_t = None
+        ang_last_wz = None
 
         # ---- 只读观测界面（不影响控制：只读快照，从不发送任何 ASDU 报文）----
         if args.web_port:
@@ -494,6 +518,18 @@ def main():
                 last_beat = now
             link.pump(0.004)   # 只给它 4ms，别占满 50ms 周期
 
+            # ---- 转向角度积分（定角转向用）----
+            # ⚠ 必须用【MotionStatus 帧到达的时刻】做积分，不能用当前时刻 ——
+            #   否则同一帧会被反复积分、角度虚高（turn_90_test.py 里踩过）。
+            #   靠 motion_seq 判断"有没有新帧"，只在有新帧时积一次。
+            if link.motion_seq != ang_last_seq and link.motion_rx_t is not None:
+                st, wz = link.motion_rx_t, link.vel["AngularZ"]
+                if ang_last_t is not None:
+                    dt = st - ang_last_t
+                    if 0.0 < dt < 0.5:            # 超过 0.5s 说明中间丢过帧，不积
+                        turn_angle += 0.5 * (ang_last_wz + wz) * dt
+                ang_last_t, ang_last_wz, ang_last_seq = st, wz, link.motion_seq
+
             # ---- 读最新 tag ----
             tid, px, frame_ts, good_ts, good_id, good_px, det_ms = shared.get()
             # 过期判断用【最后一次真的命中】的时间，不是最后一帧的时间。
@@ -522,8 +558,11 @@ def main():
             if kind == AXIS:
                 out[axis] = s * sign[axis] * mag[axis]
                 gait_phase = "idle"
+                if axis != "yaw":
+                    turn_phase = "idle"    # 非转向动作 → 打断转向状态
             elif kind == STOP:
                 gait_phase = "idle"
+                turn_phase = "idle"        # tag 拿开 → 下次可以重新转
             else:   # GAIT —— 步态切换子状态机
                 # §1.2.4：步态切换必须在机器人【完全停止】后下发，否则指令
                 # 被缓存、停稳后才执行。所以分三段走：停稳 → 下发 → 等生效。
@@ -571,6 +610,37 @@ def main():
                                   f"—— 下轮重试")
                 if gait_phase == "done":
                     name = f"{label}·已生效({hex(tg)})"
+                turn_phase = "idle"        # 切步态 → 打断转向状态
+
+            # ---- 定角转向子状态机（只对 yaw 动作，且 --turn-deg > 0 时生效）----
+            # 每举一次 tag 只转 --turn-deg 度，转够就停；要再转得把 tag 拿开重举。
+            # 用实测积分出的角度判定，不看转速 —— Yaw 通道低值区不可靠
+            # （实测 0.35~0.40 死区、0.25 有 40% 不转），闭环角度才稳。
+            if kind == AXIS and axis == "yaw" and args.turn_deg > 0:
+                if turn_phase != "idle" and turn_tag != tid:
+                    turn_phase = "idle"    # 左↔右 换了 tag → 重来
+                if turn_phase == "idle":
+                    turn_phase, turn_tag, turn_t0 = "turning", tid, now
+                    turn_angle = 0.0
+                    turn_target = math.copysign(math.radians(args.turn_deg),
+                                                out["yaw"])
+                    log_state(f"定角转向：目标 {args.turn_deg:+.0f}°")
+                if turn_phase == "turning":
+                    if abs(turn_angle) >= abs(turn_target):
+                        turn_phase = "done"
+                        log_state(f"✅ 已转 {math.degrees(turn_angle):+.1f}°"
+                                  f"（目标 {args.turn_deg:.0f}°）")
+                    elif now - turn_t0 > args.turn_timeout:
+                        turn_phase = "done"
+                        log_state(f"⚠️ {args.turn_timeout:.0f}s 内只转了 "
+                                  f"{math.degrees(turn_angle):+.1f}°，目标 "
+                                  f"{args.turn_deg:.0f}° —— 停（没转够）")
+                if turn_phase == "done":
+                    out["yaw"] = 0.0       # 转够 → 归零，别一直转下去
+                    name = f"{name}·已到位({math.degrees(turn_angle):+.0f}°)"
+                else:
+                    name = (f"{name}·{math.degrees(turn_angle):+.0f}°"
+                            f"/{args.turn_deg:.0f}°")
 
             # ---- 状态门：上报中断 / FATAL 故障 / 不在 RL 控制 → 停止 ----
             # ⚠ 必须放在 pump() 之后，用最新状态判断。只看 motion_state 的值

@@ -144,6 +144,11 @@ class RobotLink:
         self.linear_x = 0.0                       # 保留原名，老调用方在用
         self.vel = {"LinearX": 0.0, "LinearY": 0.0, "LinearZ": 0.0,
                     "AngularZ": 0.0, "Roll": 0.0, "Pitch": 0.0, "Yaw": 0.0}
+        # 定角转向要用：MotionStatus 的到达序号和时间戳。
+        # 积分 AngularZ 时【必须用上位机收到该帧的时刻】，不能用控制循环的当前时刻
+        # —— 否则同一条反馈会被反复积分、角度虚高（turn_90_test.py 里踩过）。
+        self.motion_seq = 0
+        self.motion_rx_t = None
         # ---- 设备状态上报（2Hz）：16 电机 + 16 驱动器温度、电池 ----
         self.device = {"motor": [], "driver": [], "battery": {}, "ts": 0.0}
         # ---- 故障（§1.5 的 ErrorList 原始条目）----
@@ -212,6 +217,8 @@ class RobotLink:
                     if isinstance(v, (int, float)):
                         self.vel[k] = float(v)
                 self.linear_x = self.vel["LinearX"]      # 保留原名，老调用方在用
+                self.motion_seq += 1
+                self.motion_rx_t = time.monotonic()
                 n += 1
 
             # 设备状态上报（16 电机 + 16 驱动器温度、电池），2Hz。
