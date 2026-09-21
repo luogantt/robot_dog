@@ -143,7 +143,7 @@ def main():
 
     # 比例式：偏角越大转得越快，且单调
     outs = []
-    for deg in (8.0, 20.0, 35.0):
+    for deg in (15.0, 25.0, 35.0):
         c = FollowController(FollowConfig())
         r = math.radians(deg)
         pos = (5.0, 5.0 * math.tan(r), -0.2)
@@ -153,9 +153,24 @@ def main():
     check("比例式：偏角越大 wz 越大（单调）",
           all(outs[i] < outs[i + 1] for i in range(2)),
           " → ".join(f"{v:+.3f}" for v in outs))
-    check("比例式小偏角给【中间值】（不是 0 也不是满值）",
-          0.0 < outs[0] < FollowConfig().max_wz,
-          f"8° → wz={outs[0]:+.3f}（开关式下这里是 {FollowConfig().max_wz:+.1f}）")
+
+    # ★ 死区跃迁：算出的中间值落在 Yaw 死区（0.33~0.45）里时必须跳过，
+    #   不能原样发出去 —— 原样发出去机器人会「时转时不转」，跟随一顿一顿。
+    cfg = FollowConfig()
+    bad = []
+    for deg10 in range(50, 400):          # 5.0° ~ 40.0°，步长 0.1°
+        deg = deg10 / 10.0
+        c = FollowController(FollowConfig())
+        r = math.radians(deg)
+        pos = (5.0, 5.0 * math.tan(r), -0.2)
+        for i in range(6):
+            vx, wz, why = run(c, pos, i * DT)
+        if 0.0 < abs(wz) < cfg.yaw_dead_hi:
+            bad.append((deg, wz))
+    check(f"没有任何偏角会输出 (0, {cfg.yaw_dead_hi}) 之间的值（跳过死区）",
+          not bad,
+          f"违规 {len(bad)} 处，例如 " + ", ".join(f"{d}°→{w:+.3f}" for d, w in bad[:3]) if bad
+          else f"扫了 5~40° 共 350 个角度，全部落在 0 或 ≥{cfg.yaw_dead_hi}")
 
     # 开关式仍可切（实验用）
     c = FollowController(FollowConfig(yaw_bangbang=True))

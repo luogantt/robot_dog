@@ -51,6 +51,12 @@ class FollowConfig:
     max_wz: float = 1.00            # 转向上限；0.5≈43°/s，1.0≈102°/s
     yaw_bangbang: bool = False      # False=比例式（跟随用）；True=开关式（实验用）
     yaw_deadband_deg: float = 5.0   # 方位误差小于这个角度就不转向，防抖
+    # Yaw 命令的【死区跃迁】。实测 0.35~0.40 是死区（见上），而比例式算出的
+    # 中间值很容易落进去（kp_yaw=2.0 时，偏差 10~13° 正好给出 0.35~0.42）——
+    # 机器人于是「时转时不转」，跟随起来一顿一顿。
+    # 对策：输出不在死区里取中间值 —— 要么是 0，要么直接跳到上沿以上。
+    yaw_dead_lo: float = 0.33       # 低于这个模长 → 当 0
+    yaw_dead_hi: float = 0.45       # 落在 [lo, hi) → 直接抬到 hi
     # 【已移除】沿 tag 法向量偏移目标点的方案（2026-09-20 删除）。
     # 需求原话是 T = tag位置 + target × n（n = tag 法向量），实测两个问题：
     #  1) 法向量的 EMA 滤波会形成正反馈：狗一转身 → 滤波滞后 → 目标点
@@ -188,6 +194,17 @@ class FollowController:
             # 比例式（默认）：方位误差越大转得越快。0.5≈43°/s、1.0≈102°/s，
             # 只要期望值不落在 0.35~0.40 那个死区里就可靠（见 FollowConfig）。
             wz = float(np.clip(c.kp_yaw * heading, -c.max_wz, c.max_wz))
+
+        # ---- 跳过 Yaw 通道的死区 ----
+        # 实测 0.35~0.40 是死区（连测多次确认），而比例式算出的中间值很容易
+        # 落进去 —— kp_yaw=2.0 时偏差 10~13° 正好给出 0.35~0.42。
+        # 落进去的表现就是「时转时不转」→ 跟随起来一顿一顿。
+        # 所以不在这段取中间值：低于下沿当 0，落在区间里直接抬到上沿。
+        m = abs(wz)
+        if m < c.yaw_dead_lo:
+            wz = 0.0
+        elif m < c.yaw_dead_hi:
+            wz = math.copysign(c.yaw_dead_hi, wz)
 
         vx = self._slew(vx, self.last_vx, c.max_accel_hz, dt)
         if not c.yaw_bangbang:
