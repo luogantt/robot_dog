@@ -321,7 +321,8 @@ def main():
                     "det": {"rows": [
                         {"k": "控制律", "v": vs.get("why") or "—"},
                         {"k": "tag 位置（前/左）",
-                         "v": "—" if not pos else f'{pos[0]:+.2f} / {pos[1]:+.2f} m'},
+                         "v": ("—" if pos is None
+                               else f'{pos[0]:+.2f} / {pos[1]:+.2f} m')},
                         {"k": "距 tag", "v": "—" if vs.get("dist") is None
                             else f'{vs["dist"]:.2f} m（目标 {args.target:.2f}）'},
                         # 配色：本帧=绿；宽限内=黄；丢失=红；从未检测到=不标色
@@ -413,10 +414,14 @@ def main():
             ticks += 1
 
             # ---- 更新观测界面快照（HTTP 线程读；锁只保护这一次整体赋值）----
-            dist = ((pos[0] ** 2 + pos[1] ** 2) ** 0.5) if pos else None
+            # ⚠️ 必须用 is not None —— pos 是 numpy 数组（tag_in_body 返回），
+            #    而 `if pos` 对多元素数组会抛 ValueError（踩过：程序一看到 tag 就崩）
+            dist = (float((pos[0] ** 2 + pos[1] ** 2) ** 0.5)
+                    if pos is not None else None)
             with view_lock:
                 view_state.update(why=why, vx=vx, wz=wz, tgt=tgt, gate=gate,
-                                  pos=(tuple(pos) if pos else None), dist=dist,
+                                  pos=(tuple(pos) if pos is not None else None),
+                                  dist=dist,
                                   ticks=ticks, sent=sent, det_ms=det_ms)
             if why != cur_why:                 # 状态变化才记一条，别刷屏
                 EVENTS.add("info", why)
